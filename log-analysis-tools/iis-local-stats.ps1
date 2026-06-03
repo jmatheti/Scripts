@@ -19,11 +19,11 @@
 
 .NOTES
     Author  : Janardhan Matheti
-    Version : 1.0
-    Updated : 06-02-2026
+    Version : 1.1
+    Updated : 06-03-2026
     Requires: PowerShell 5.1 or later. No external modules needed.
               Log files must be in standard IIS W3C format with a #Fields: header.
-              Times in IIS logs are UTC by default.
+              Times in IIS logs are displayed as-is (no timezone conversion).
 #>
 
 [CmdletBinding()]
@@ -147,7 +147,7 @@ function Parse-IisW3cFile {
 
             $dt = $null
             try {
-                $dt = [datetime]::ParseExact("$date $time", "yyyy-MM-dd HH:mm:ss", $null)
+                $dt = [datetime]::ParseExact("$date $time", "yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture)
             } catch { continue }
             if (-not $dt) { continue }
 
@@ -252,7 +252,7 @@ $dailyPivot = $all |
     ForEach-Object {
         $s01, $s02 = Get-ServerCounts $_.Group
         [pscustomobject]@{
-            Date     = ([datetime]$_.Name).ToString("yyyy-MM-dd")
+            Date     = $_.Group[0].Date.ToString("yyyy-MM-dd")
             Server01 = $s01
             Server02 = $s02
             Total    = $s01 + $s02
@@ -268,7 +268,7 @@ $hourlyPivot = $all |
     ForEach-Object {
         $s01, $s02 = Get-ServerCounts $_.Group
         [pscustomobject]@{
-            DateHour = ([datetime]$_.Name).ToString("yyyy-MM-dd HH:00")
+            DateHour = $_.Group[0].DateHour.ToString("yyyy-MM-dd HH:00")
             Server01 = $s01
             Server02 = $s02
             Total    = $s01 + $s02
