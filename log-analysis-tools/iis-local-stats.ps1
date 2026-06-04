@@ -4,15 +4,18 @@
 
 .DESCRIPTION
     Scans copied IIS W3C .log files from a specified folder on the local server,
-    normalizes API paths, filters out Azure Load Balancer Agent traffic, and outputs
-    one or more of the following reports based on your selection:
+    normalizes API paths, and outputs one or more of the following reports:
 
-        [1] Traffic by Day        - Date | Total
-        [2] Traffic by Hour       - DateHour | Total
-        [3] Status Categories     - 2xx / 3xx / 4xx / 5xx counts
-        [4] Top 30 Failed         - NormalizedUri + status code + hit count
-        [5] Top 30 Slowest        - NormalizedUri + Hits / AvgMs / P95Ms / MaxMs
+        [1] Traffic by Day        - Date | UserTotal | LBAgentTotal | GrandTotal
+        [2] Traffic by Hour       - DateHour | UserTotal | LBAgentTotal | GrandTotal
+        [3] Status Categories     - 2xx / 3xx / 4xx / 5xx counts (user traffic only)
+        [4] Top 30 Failed         - NormalizedUri + status code + hit count (user traffic only)
+        [5] Top 30 Slowest        - NormalizedUri + Hits / AvgMs / P95Ms / MaxMs (user traffic only)
         [A] All reports
+
+    Traffic reports [1] and [2] show both user traffic and Load Balancer Agent
+    traffic (User-Agent containing "Load+Balancer+Agent") as separate columns
+    so you can clearly see the split. Reports [3]-[5] use user traffic only.
 
     Incremental runs: tracks the last run timestamp and only processes new log
     entries on each subsequent run. Run once a week — picks up from last run.
@@ -26,7 +29,7 @@
 
 .NOTES
     Author  : Janardhan Matheti
-    Version : 2.1
+    Version : 2.2
     Updated : 06-04-2026
     Requires: PowerShell 5.1 or later. No external modules needed.
               Point to a COPY of IIS logs — not the live folder IIS writes to.
@@ -73,11 +76,11 @@ if (-not (Test-Path $reportsFolder)) {
 # -- Report selection ----------------------------------------------------------
 Write-Host ""
 Write-Host "Available reports:" -ForegroundColor Cyan
-Write-Host "  [1] Traffic by Day"
-Write-Host "  [2] Traffic by Hour"
-Write-Host "  [3] Status Categories  (2xx / 3xx / 4xx / 5xx)"
-Write-Host "  [4] Top 30 Failed Endpoints"
-Write-Host "  [5] Top 30 Slowest Endpoints"
+Write-Host "  [1] Traffic by Day     (User | LB Agent | Grand Total)"
+Write-Host "  [2] Traffic by Hour    (User | LB Agent | Grand Total)"
+Write-Host "  [3] Status Categories  (2xx / 3xx / 4xx / 5xx — user traffic only)"
+Write-Host "  [4] Top 30 Failed Endpoints  (user traffic only)"
+Write-Host "  [5] Top 30 Slowest Endpoints (user traffic only)"
 Write-Host "  [A] All reports"
 Write-Host ""
 Write-Host "You can select multiple reports — e.g. enter: 1,3,5  or  A"
@@ -175,7 +178,7 @@ Write-Host " IIS Local Log Analysis"
 Write-Host " Server  : $serverName"
 Write-Host " Folder  : $logFolder"
 Write-Host " Run at  : $($runTimestamp.ToString('yyyy-MM-dd HH:mm:ss'))"
-Write-Host (" Reports : {0}" -f ($selectedReports | ForEach-Object { "[$_] $($reportLabels[$_])" }) -join ', ')
+Write-Host (" Reports : {0}" -f (($selectedReports | ForEach-Object { "[$_] $($reportLabels[$_])" }) -join ', '))
 if ($isIncremental) {
     Write-Host " Since   : $($lastRunTime.ToString('yyyy-MM-dd HH:mm:ss')) (incremental)"
 } else {
@@ -184,6 +187,9 @@ if ($isIncremental) {
 Write-Host "============================================="
 
 $ErrorActionPreference = "Stop"
+
+# LB Agent pattern
+$lbAgentPattern = '(?i)load(\+|\s)*balancer(\+|\s)*agent'
 
 # -----------------------------------------------------------------------------
 # FUNCTION: Normalize-UriStem
@@ -214,10 +220,10 @@ function Normalize-UriStem {
 # -----------------------------------------------------------------------------
 function Parse-IisW3cFile {
     param(
-        [Parameter(Mandatory)] [string]              $filePath,
-        [Parameter(Mandatory=$false)] [nullable[datetime]] $sinceTime = $null,
-        [Parameter(Mandatory)] [bool]                $needUri,
-        [Parameter(Mandatory)] [bool]                $needTimeTaken
+        [Parameter(Mandatory)] [string]                    $filePath,
+        [Parameter(Mandatory=$false)] [nullable[datetime]] $sinceTime    = $null,
+        [Parameter(Mandatory)] [bool]                      $needUri,
+        [Parameter(Mandatory)] [bool]                      $needTimeTaken
     )
 
     $fields = $null
@@ -256,6 +262,8 @@ function Parse-IisW3cFile {
             $timeTaken = 0
             if ($needTimeTaken) { [int]::TryParse($row["time-taken"], [ref]$timeTaken) | Out-Null }
 
+            $userAgent    = $row["cs(User-Agent)"]
+            $isLBAgent    = $userAgent -match '(?i)load(\+|\s)*balancer(\+|\s)*agent'
             $uriStem      = if ($needUri) { $row["cs-uri-stem"] } else { $null }
             $normalizedUri = if ($needUri) { Normalize-UriStem -uriStem $uriStem } else { $null }
 
@@ -266,7 +274,8 @@ function Parse-IisW3cFile {
                 NormalizedUri = $normalizedUri
                 Status        = $status
                 TimeTakenMs   = $timeTaken
-                UserAgent     = $row["cs(User-Agent)"]
+                UserAgent     = $userAgent
+                IsLBAgent     = $isLBAgent
             }
         }
     }
@@ -276,7 +285,6 @@ function Parse-IisW3cFile {
 # MAIN — Load and parse log files
 # =============================================================================
 
-# Determine which fields are actually needed based on selected reports
 $needUri       = ($selectedReports -contains 4) -or ($selectedReports -contains 5)
 $needTimeTaken = ($selectedReports -contains 5)
 
@@ -291,7 +299,6 @@ if ($files.Count -eq 0) {
     exit 1
 }
 
-# For incremental runs, skip files not modified since last run
 if ($isIncremental) {
     $filesBeforeFilter = $files.Count
     $files = @($files | Where-Object { $_.LastWriteTime -gt $lastRunTime })
@@ -314,32 +321,43 @@ foreach ($f in $files) {
 }
 
 Write-Progress -Activity "Parsing IIS logs" -Completed
-Write-Host "Total requests parsed (before filter) : $($all.Count)"
 
-if ($all.Count -eq 0) {
-    Write-Host ""
+$totalAll     = $all.Count
+$totalLBAgent = ($all | Where-Object { $_.IsLBAgent }).Count
+$totalUser    = $totalAll - $totalLBAgent
+
+Write-Host "Total requests parsed           : $totalAll"
+Write-Host "  — User traffic                : $totalUser"
+Write-Host "  — LB Agent traffic            : $totalLBAgent"
+Write-Host ""
+
+if ($totalAll -eq 0) {
     Write-Warning "No new log entries found since last run ($lastRunTime). Nothing to report."
     Stop-Transcript | Out-Null
     $runTimestamp.ToString("yyyy-MM-dd HH:mm:ss") | Set-Content $stateFile
     exit 0
 }
 
-# Exclude Azure Load Balancer Agent traffic
-$all = @($all | Where-Object { $_.UserAgent -notmatch '(?i)load(\+|\s)*balancer(\+|\s)*agent' })
-Write-Host "Total requests (after LB agent filter) : $($all.Count)"
-Write-Host ""
+# Separate collections
+$userTraffic  = @($all | Where-Object { -not $_.IsLBAgent })
+$lbTraffic    = @($all | Where-Object { $_.IsLBAgent })
 
 # -- [1] Traffic by Day -------------------------------------------------------
 $dailyPivot = $null
 if ($selectedReports -contains 1) {
-    $dailyPivot = $all |
-        Group-Object Date |
-        ForEach-Object {
-            [pscustomobject]@{
-                Date  = $_.Group[0].Date.ToString("yyyy-MM-dd")
-                Total = $_.Count
-            }
-        } | Sort-Object Date
+    $allDates = ($all | Select-Object -ExpandProperty Date | Sort-Object -Unique)
+
+    $dailyPivot = $allDates | ForEach-Object {
+        $d          = $_
+        $userCount  = ($userTraffic | Where-Object { $_.Date -eq $d }).Count
+        $lbCount    = ($lbTraffic   | Where-Object { $_.Date -eq $d }).Count
+        [pscustomobject]@{
+            Date         = $d.ToString("yyyy-MM-dd")
+            UserTotal    = $userCount
+            LBAgentTotal = $lbCount
+            GrandTotal   = $userCount + $lbCount
+        }
+    } | Sort-Object Date
 
     "`n=== [1] Traffic by Day ==="
     $dailyPivot | Format-Table -AutoSize
@@ -348,23 +366,28 @@ if ($selectedReports -contains 1) {
 # -- [2] Traffic by Hour ------------------------------------------------------
 $hourlyPivot = $null
 if ($selectedReports -contains 2) {
-    $hourlyPivot = $all |
-        Group-Object DateHour |
-        ForEach-Object {
-            [pscustomobject]@{
-                DateHour = $_.Group[0].DateHour.ToString("yyyy-MM-dd HH:00")
-                Total    = $_.Count
-            }
-        } | Sort-Object DateHour
+    $allHours = ($all | Select-Object -ExpandProperty DateHour | Sort-Object -Unique)
+
+    $hourlyPivot = $allHours | ForEach-Object {
+        $h          = $_
+        $userCount  = ($userTraffic | Where-Object { $_.DateHour -eq $h }).Count
+        $lbCount    = ($lbTraffic   | Where-Object { $_.DateHour -eq $h }).Count
+        [pscustomobject]@{
+            DateHour     = $h.ToString("yyyy-MM-dd HH:00")
+            UserTotal    = $userCount
+            LBAgentTotal = $lbCount
+            GrandTotal   = $userCount + $lbCount
+        }
+    } | Sort-Object DateHour
 
     "`n=== [2] Traffic by Hour ==="
     $hourlyPivot | Format-Table -AutoSize
 }
 
-# -- [3] Status Categories ----------------------------------------------------
+# -- [3] Status Categories (user traffic only) --------------------------------
 $statusCats = $null
 if ($selectedReports -contains 3) {
-    $statusCats = $all | ForEach-Object {
+    $statusCats = $userTraffic | ForEach-Object {
         $cat =
             if    ($_.Status -ge 200 -and $_.Status -le 299) { "2xx Success" }
             elseif($_.Status -ge 300 -and $_.Status -le 399) { "3xx Redirect" }
@@ -378,14 +401,14 @@ if ($selectedReports -contains 3) {
         [pscustomobject]@{ Category = $_.Name; Count = $_.Count }
     } | Sort-Object Category
 
-    "`n=== [3] Status Categories ==="
+    "`n=== [3] Status Categories (user traffic only) ==="
     $statusCats | Format-Table -AutoSize
 }
 
-# -- [4] Top 30 Failed Endpoints ----------------------------------------------
+# -- [4] Top 30 Failed Endpoints (user traffic only) --------------------------
 $topFailed = $null
 if ($selectedReports -contains 4) {
-    $topFailed = $all |
+    $topFailed = $userTraffic |
         Where-Object { $_.Status -ge 400 -and $_.Status -le 599 } |
         Group-Object NormalizedUri, Status |
         ForEach-Object {
@@ -395,14 +418,14 @@ if ($selectedReports -contains 4) {
         Sort-Object Hits -Descending |
         Select-Object -First 30
 
-    "`n=== [4] Top 30 Failed Endpoints ==="
+    "`n=== [4] Top 30 Failed Endpoints (user traffic only) ==="
     $topFailed | Format-Table -AutoSize
 }
 
-# -- [5] Top 30 Slowest Endpoints ---------------------------------------------
+# -- [5] Top 30 Slowest Endpoints (user traffic only) -------------------------
 $slow = $null
 if ($selectedReports -contains 5) {
-    $slow = $all |
+    $slow = $userTraffic |
         Where-Object {
             $_.TimeTakenMs -gt 0 -and
             -not [string]::IsNullOrWhiteSpace($_.NormalizedUri) -and
@@ -427,7 +450,7 @@ if ($selectedReports -contains 5) {
         Sort-Object AvgMs -Descending |
         Select-Object -First 30
 
-    "`n=== [5] Top 30 Slowest Endpoints (minHits=$minHits) ==="
+    "`n=== [5] Top 30 Slowest Endpoints (user traffic only, minHits=$minHits) ==="
     $slow | Format-Table -AutoSize
 }
 
