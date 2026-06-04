@@ -1,16 +1,21 @@
 <#
 .SYNOPSIS
-    Analyzes IIS W3C log files locally from two servers and produces 5 analysis tables.
+    Analyzes IIS W3C log files on the current server and produces 5 analysis tables.
 
 .DESCRIPTION
-    Scans IIS W3C .log files from two server folders, normalizes API paths,
-    filters out Azure Load Balancer Agent traffic, and outputs:
+    Scans copied IIS W3C .log files from a specified folder on the local server,
+    normalizes API paths, filters out Azure Load Balancer Agent traffic, and outputs:
 
-        [1] Traffic by Day        - Date | Server01 | Server02 | Total
-        [2] Traffic by Hour       - DateHour | Server01 | Server02 | Total
-        [3] Status Categories     - 2xx / 3xx / 4xx / 5xx counts per server
+        [1] Traffic by Day        - Date | Total
+        [2] Traffic by Hour       - DateHour | Total
+        [3] Status Categories     - 2xx / 3xx / 4xx / 5xx counts
         [4] Top 30 Failed         - NormalizedUri + status code + hit count
         [5] Top 30 Slowest        - NormalizedUri + Hits / AvgMs / P95Ms / MaxMs
+
+    Incremental runs: tracks the last run timestamp and only processes new log
+    entries on each subsequent run. Run once a week — picks up from last run.
+
+    Output: saves a timestamped report transcript alongside the analysis results.
 
     URI normalization rules:
         Numeric segments  =>  {id}     e.g. /api/orders/123  => /api/orders/{id}
@@ -19,44 +24,52 @@
 
 .NOTES
     Author  : Janardhan Matheti
-    Version : 1.1
+    Version : 2.0
     Updated : 06-03-2026
     Requires: PowerShell 5.1 or later. No external modules needed.
+              Point to a COPY of IIS logs — not the live folder IIS writes to.
               Log files must be in standard IIS W3C format with a #Fields: header.
-              Times in IIS logs are displayed as-is (no timezone conversion).
+              Times are used as-is from the log files (no timezone conversion).
 #>
 
 [CmdletBinding()]
 param ()
 
+$serverName = $env:COMPUTERNAME
+
 Write-Host ""
 Write-Host "=== IIS Local Log Analysis ===" -ForegroundColor Cyan
-Write-Host "Analyzes IIS W3C log files from two servers and produces 5 analysis tables."
+Write-Host "Server  : $serverName"
+Write-Host "Analyzes copied IIS W3C log files and produces 5 analysis tables."
 Write-Host ""
 
 # -- Guided input --------------------------------------------------------------
 
-# Root folder
+# IIS log folder
 do {
-    $root = Read-Host "Enter the root folder containing server log subfolders"
-    if ([string]::IsNullOrWhiteSpace($root)) {
-        Write-Warning "Root folder path cannot be empty."
-    } elseif (-not (Test-Path $root)) {
-        Write-Warning "Folder not found: $root"
-        $root = $null
+    $logFolder = Read-Host "Enter the path to the copied IIS log folder"
+    if ([string]::IsNullOrWhiteSpace($logFolder)) {
+        Write-Warning "Log folder path cannot be empty."
+    } elseif (-not (Test-Path $logFolder)) {
+        Write-Warning "Folder not found: $logFolder"
+        $logFolder = $null
     }
-} while ([string]::IsNullOrWhiteSpace($root))
+} while ([string]::IsNullOrWhiteSpace($logFolder))
 
-# Server subfolder names
-$serverInput = Read-Host "Enter server subfolder names, comma-separated (default: 01,02 — press Enter to use default)"
-if ([string]::IsNullOrWhiteSpace($serverInput)) {
-    $serverNames = @("01", "02")
-} else {
-    $serverNames = $serverInput -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+# Reports output folder
+$defaultReportsFolder = Join-Path $logFolder "Reports"
+Write-Host ""
+Write-Host "Default reports folder: $defaultReportsFolder"
+$reportsInput   = Read-Host "Reports output folder (press Enter to use default)"
+$reportsFolder  = if ([string]::IsNullOrWhiteSpace($reportsInput)) { $defaultReportsFolder } else { $reportsInput.Trim() }
+
+if (-not (Test-Path $reportsFolder)) {
+    New-Item -ItemType Directory -Path $reportsFolder -Force | Out-Null
+    Write-Host "Created reports folder: $reportsFolder"
 }
 
 # Minimum hits for slowest endpoints table
-$minHitsInput = Read-Host "Minimum hits to appear in slowest endpoints table (default: 20 — press Enter to use default)"
+$minHitsInput = Read-Host "Minimum hits for slowest endpoints table (default: 20 — press Enter to use default)"
 $minHits = 20
 if (-not [string]::IsNullOrWhiteSpace($minHitsInput)) {
     $parsed = 0
@@ -68,15 +81,35 @@ if (-not [string]::IsNullOrWhiteSpace($minHitsInput)) {
 }
 
 # Export CSVs?
-$exportInput = Read-Host "Export results to CSV files in the root folder? (Y/N — default: N)"
+$exportInput = Read-Host "Export results to CSV files in the reports folder? (Y/N — default: N)"
 $exportCsv   = $exportInput -match '^[Yy]$'
+
+# -- Last run state ------------------------------------------------------------
+$stateFile    = Join-Path $reportsFolder "iis-lastrun-$serverName.txt"
+$lastRunTime  = $null
+$isIncremental = $false
+
+if (Test-Path $stateFile) {
+    $lastRunRaw = Get-Content $stateFile -Raw
+    $parsedLast = [datetime]::MinValue
+    if ([datetime]::TryParse($lastRunRaw.Trim(), [ref]$parsedLast) -and $parsedLast -ne [datetime]::MinValue) {
+        $lastRunTime   = $parsedLast
+        $isIncremental = $true
+    }
+}
 
 Write-Host ""
 Write-Host "Settings:" -ForegroundColor Cyan
-Write-Host "  Root folder : $root"
-Write-Host "  Servers     : $($serverNames -join ', ')"
-Write-Host "  Min hits    : $minHits"
-Write-Host "  Export CSV  : $exportCsv"
+Write-Host "  Server          : $serverName"
+Write-Host "  Log folder      : $logFolder"
+Write-Host "  Reports folder  : $reportsFolder"
+Write-Host "  Min hits        : $minHits"
+Write-Host "  Export CSV      : $exportCsv"
+if ($isIncremental) {
+    Write-Host "  Mode            : Incremental (entries after $lastRunTime)" -ForegroundColor Yellow
+} else {
+    Write-Host "  Mode            : Full (first run — all entries)" -ForegroundColor Green
+}
 Write-Host ""
 
 $confirm = Read-Host "Start analysis? (Y/N)"
@@ -85,7 +118,23 @@ if ($confirm -notmatch '^[Yy]$') {
     exit 0
 }
 
+# -- Start transcript (report file) -------------------------------------------
+$runTimestamp  = Get-Date
+$reportFile    = Join-Path $reportsFolder ("iis-report-{0}-{1}.txt" -f $serverName, $runTimestamp.ToString("yyyyMMdd-HHmmss"))
+Start-Transcript -Path $reportFile -Append | Out-Null
+
 Write-Host ""
+Write-Host "============================================="
+Write-Host " IIS Local Log Analysis"
+Write-Host " Server  : $serverName"
+Write-Host " Folder  : $logFolder"
+Write-Host " Run at  : $($runTimestamp.ToString('yyyy-MM-dd HH:mm:ss'))"
+if ($isIncremental) {
+    Write-Host " Since   : $($lastRunTime.ToString('yyyy-MM-dd HH:mm:ss')) (incremental)"
+} else {
+    Write-Host " Since   : (all entries — first run)"
+}
+Write-Host "============================================="
 
 $ErrorActionPreference = "Stop"
 
@@ -118,8 +167,8 @@ function Normalize-UriStem {
 # -----------------------------------------------------------------------------
 function Parse-IisW3cFile {
     param(
-        [Parameter(Mandatory)] [string] $serverName,
-        [Parameter(Mandatory)] [string] $filePath
+        [Parameter(Mandatory)] [string]   $filePath,
+        [Parameter(Mandatory=$false)] [nullable[datetime]] $sinceTime = $null
     )
 
     $fields = $null
@@ -151,13 +200,15 @@ function Parse-IisW3cFile {
             } catch { continue }
             if (-not $dt) { continue }
 
+            # Incremental filter — skip entries on or before last run
+            if ($sinceTime -and $dt -le $sinceTime) { continue }
+
             $status    = 0; [int]::TryParse($row["sc-status"],  [ref]$status)    | Out-Null
             $timeTaken = 0; [int]::TryParse($row["time-taken"], [ref]$timeTaken) | Out-Null
 
             $uriStem = $row["cs-uri-stem"]
 
             [pscustomobject]@{
-                Server        = $serverName
                 Date          = $dt.Date
                 DateHour      = [datetime]::new($dt.Year, $dt.Month, $dt.Day, $dt.Hour, 0, 0)
                 Method        = $row["cs-method"]
@@ -171,111 +222,82 @@ function Parse-IisW3cFile {
     }
 }
 
-# -----------------------------------------------------------------------------
-# FUNCTION: Load-IisEventsForServer
-# -----------------------------------------------------------------------------
-function Load-IisEventsForServer {
-    param([Parameter(Mandatory)][string]$serverName)
-
-    $iisPath = Join-Path $root "$serverName\IIS"
-
-    if (-not (Test-Path $iisPath)) {
-        Write-Warning "  [SKIP] Path not found: $iisPath"
-        return
-    }
-
-    Write-Host "[$serverName] Scanning: $iisPath"
-    $files = @(Get-ChildItem -Path $iisPath -Recurse -File -Filter *.log -ErrorAction SilentlyContinue)
-    Write-Host "[$serverName] Found $($files.Count) .log file(s)"
-
-    if ($files.Count -eq 0) { return }
-
-    $events = [System.Collections.Generic.List[object]]::new()
-    $i = 0
-
-    foreach ($f in $files) {
-        $i++
-        Write-Progress `
-            -Activity    "[$serverName] Parsing IIS logs" `
-            -Status      "File $i / $($files.Count) : $($f.Name)" `
-            -PercentComplete ([int](($i / [double]$files.Count) * 100))
-
-        foreach ($e in (Parse-IisW3cFile -serverName $serverName -filePath $f.FullName)) {
-            $events.Add($e)
-        }
-    }
-
-    Write-Progress -Activity "[$serverName] Parsing IIS logs" -Completed
-    Write-Host "[$serverName] Parsed $($events.Count) request lines"
-
-    return $events
-}
-
 # =============================================================================
-# MAIN
+# MAIN — Load and parse log files
 # =============================================================================
-Write-Host "============================================="
-Write-Host " IIS Local Log Analysis"
-Write-Host " Root    : $root"
-Write-Host " Servers : $($serverNames -join ', ')"
-Write-Host "============================================="
+Write-Host ""
+Write-Host "Scanning: $logFolder"
+$files = @(Get-ChildItem -Path $logFolder -Recurse -File -Filter *.log -ErrorAction SilentlyContinue)
+Write-Host "Found $($files.Count) .log file(s)"
 
-$all = [System.Collections.Generic.List[object]]::new()
-foreach ($s in $serverNames) {
-    $loaded = Load-IisEventsForServer -serverName $s
-    if ($loaded) { foreach ($e in $loaded) { $all.Add($e) } }
-}
-
-if ($all.Count -eq 0) {
-    Write-Warning "No IIS log events found. Check paths under $root"
+if ($files.Count -eq 0) {
+    Write-Warning "No .log files found in: $logFolder"
+    Stop-Transcript | Out-Null
     exit 1
 }
 
-Write-Host "`nTotal requests parsed (before filter) : $($all.Count)"
+# For incremental runs, skip files that haven't been modified since last run
+if ($isIncremental) {
+    $filesBeforeFilter = $files.Count
+    $files = @($files | Where-Object { $_.LastWriteTime -gt $lastRunTime })
+    Write-Host "Files after last-modified filter : $($files.Count) (skipped $($filesBeforeFilter - $files.Count) unchanged file(s))"
+}
 
+$all = [System.Collections.Generic.List[object]]::new()
+$i   = 0
+
+foreach ($f in $files) {
+    $i++
+    Write-Progress `
+        -Activity    "Parsing IIS logs" `
+        -Status      "File $i / $($files.Count) : $($f.Name)" `
+        -PercentComplete ([int](($i / [double]$files.Count) * 100))
+
+    foreach ($e in (Parse-IisW3cFile -filePath $f.FullName -sinceTime $lastRunTime)) {
+        $all.Add($e)
+    }
+}
+
+Write-Progress -Activity "Parsing IIS logs" -Completed
+Write-Host "Total requests parsed (before filter) : $($all.Count)"
+
+if ($all.Count -eq 0) {
+    Write-Host ""
+    Write-Warning "No new log entries found since last run ($lastRunTime). Nothing to report."
+    Stop-Transcript | Out-Null
+    # Still update the last run time so next run advances
+    $runTimestamp.ToString("yyyy-MM-dd HH:mm:ss") | Set-Content $stateFile
+    exit 0
+}
+
+# Exclude Azure Load Balancer Agent traffic
 $all = @($all | Where-Object { $_.UserAgent -notmatch '(?i)load(\+|\s)*balancer(\+|\s)*agent' })
 Write-Host "Total requests (after LB agent filter) : $($all.Count)"
-
-function Get-ServerCounts {
-    param($group)
-    $byServer = $group | Group-Object Server
-    $s01 = ($byServer | Where-Object Name -eq "01" | Select-Object -ExpandProperty Count -ErrorAction SilentlyContinue)
-    $s02 = ($byServer | Where-Object Name -eq "02" | Select-Object -ExpandProperty Count -ErrorAction SilentlyContinue)
-    if (-not $s01) { $s01 = 0 }
-    if (-not $s02) { $s02 = 0 }
-    return [int]$s01, [int]$s02
-}
 
 # -- [1] Traffic by Day -------------------------------------------------------
 $dailyPivot = $all |
     Group-Object Date |
     ForEach-Object {
-        $s01, $s02 = Get-ServerCounts $_.Group
         [pscustomobject]@{
-            Date     = $_.Group[0].Date.ToString("yyyy-MM-dd")
-            Server01 = $s01
-            Server02 = $s02
-            Total    = $s01 + $s02
+            Date  = $_.Group[0].Date.ToString("yyyy-MM-dd")
+            Total = $_.Count
         }
     } | Sort-Object Date
 
-"`n=== [1] Traffic by Day (01 vs 02 vs Total) ==="
+"`n=== [1] Traffic by Day ==="
 $dailyPivot | Format-Table -AutoSize
 
 # -- [2] Traffic by Hour ------------------------------------------------------
 $hourlyPivot = $all |
     Group-Object DateHour |
     ForEach-Object {
-        $s01, $s02 = Get-ServerCounts $_.Group
         [pscustomobject]@{
             DateHour = $_.Group[0].DateHour.ToString("yyyy-MM-dd HH:00")
-            Server01 = $s01
-            Server02 = $s02
-            Total    = $s01 + $s02
+            Total    = $_.Count
         }
     } | Sort-Object DateHour
 
-"`n=== [2] Traffic by Hour (01 vs 02 vs Total) ==="
+"`n=== [2] Traffic by Hour ==="
 $hourlyPivot | Format-Table -AutoSize
 
 # -- [3] Status Categories ----------------------------------------------------
@@ -286,15 +308,14 @@ $statusCats = $all | ForEach-Object {
         elseif($_.Status -ge 400 -and $_.Status -le 499) { "4xx ClientError" }
         elseif($_.Status -ge 500 -and $_.Status -le 599) { "5xx ServerError" }
         else  { "Other" }
-    [pscustomobject]@{ Server=$_.Server; Category=$cat }
+    [pscustomobject]@{ Category = $cat }
 } |
-Group-Object Server, Category |
+Group-Object Category |
 ForEach-Object {
-    $k = $_.Name -split ', '
-    [pscustomobject]@{ Server=$k[0]; Category=$k[1]; Count=$_.Count }
-} | Sort-Object Server, Category
+    [pscustomobject]@{ Category = $_.Name; Count = $_.Count }
+} | Sort-Object Category
 
-"`n=== [3] Status Categories (by server) ==="
+"`n=== [3] Status Categories ==="
 $statusCats | Format-Table -AutoSize
 
 # -- [4] Top 30 Failed Endpoints ----------------------------------------------
@@ -303,12 +324,12 @@ $topFailed = $all |
     Group-Object NormalizedUri, Status |
     ForEach-Object {
         $k = $_.Name -split ', '
-        [pscustomobject]@{ NormalizedUri=$k[0]; Status=[int]$k[1]; Hits=$_.Count }
+        [pscustomobject]@{ NormalizedUri = $k[0]; Status = [int]$k[1]; Hits = $_.Count }
     } |
     Sort-Object Hits -Descending |
     Select-Object -First 30
 
-"`n=== [4] Top 30 Failed Endpoints (NormalizedUri) ==="
+"`n=== [4] Top 30 Failed Endpoints ==="
 $topFailed | Format-Table -AutoSize
 
 # -- [5] Top 30 Slowest Endpoints ---------------------------------------------
@@ -337,18 +358,27 @@ $slow = $all |
     Sort-Object AvgMs -Descending |
     Select-Object -First 30
 
-"`n=== [5] Top 30 Slowest Endpoints (NormalizedUri) (minHits=$minHits) ==="
+"`n=== [5] Top 30 Slowest Endpoints (minHits=$minHits) ==="
 $slow | Format-Table -AutoSize
 
-Write-Host "`nDone." -ForegroundColor Green
+Write-Host ""
+Write-Host "Done." -ForegroundColor Green
+Write-Host "Report saved : $reportFile"
 
 # -- Optional CSV export -------------------------------------------------------
 if ($exportCsv) {
-    $dailyPivot  | Export-Csv -NoTypeInformation -Path (Join-Path $root "traffic_by_day.csv")
-    $hourlyPivot | Export-Csv -NoTypeInformation -Path (Join-Path $root "traffic_by_hour.csv")
-    $statusCats  | Export-Csv -NoTypeInformation -Path (Join-Path $root "status_categories.csv")
-    $topFailed   | Export-Csv -NoTypeInformation -Path (Join-Path $root "top_failed_endpoints.csv")
-    $slow        | Export-Csv -NoTypeInformation -Path (Join-Path $root "slow_endpoints.csv")
-    Write-Host ""
-    Write-Host "CSV files written to: $root" -ForegroundColor Green
+    $dailyPivot  | Export-Csv -NoTypeInformation -Path (Join-Path $reportsFolder ("traffic_by_day-{0}-{1}.csv"    -f $serverName, $runTimestamp.ToString("yyyyMMdd-HHmmss")))
+    $hourlyPivot | Export-Csv -NoTypeInformation -Path (Join-Path $reportsFolder ("traffic_by_hour-{0}-{1}.csv"   -f $serverName, $runTimestamp.ToString("yyyyMMdd-HHmmss")))
+    $statusCats  | Export-Csv -NoTypeInformation -Path (Join-Path $reportsFolder ("status_categories-{0}-{1}.csv" -f $serverName, $runTimestamp.ToString("yyyyMMdd-HHmmss")))
+    $topFailed   | Export-Csv -NoTypeInformation -Path (Join-Path $reportsFolder ("top_failed-{0}-{1}.csv"        -f $serverName, $runTimestamp.ToString("yyyyMMdd-HHmmss")))
+    $slow        | Export-Csv -NoTypeInformation -Path (Join-Path $reportsFolder ("slow_endpoints-{0}-{1}.csv"    -f $serverName, $runTimestamp.ToString("yyyyMMdd-HHmmss")))
+    Write-Host "CSV files saved to : $reportsFolder"
 }
+
+# -- Stop transcript -----------------------------------------------------------
+Stop-Transcript | Out-Null
+
+# -- Update last run state file ------------------------------------------------
+$runTimestamp.ToString("yyyy-MM-dd HH:mm:ss") | Set-Content $stateFile
+Write-Host ""
+Write-Host "Last run state updated : $stateFile" -ForegroundColor DarkGray
