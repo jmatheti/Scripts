@@ -69,32 +69,58 @@ Useful for analysing errors, exception trends, and affected timezones across mul
 
 ## iis-local-stats.ps1
 
-Analyzes IIS W3C log files locally from two servers and produces 5 analysis tables.
+Analyzes copied IIS W3C log files directly on the current server and produces selected analysis reports.
+Run once a week — automatically picks up from where the last run left off.
 
 **Run:**
 ```powershell
 .\iis-local-stats.ps1
 ```
 
+> **Important:** Point to a **copy** of IIS logs — not the live folder IIS is actively writing to.
+
 **Prompts:**
 | Prompt | Default | Description |
 |--------|---------|-------------|
-| Root folder path | — | Root folder containing server log subfolders |
-| Server subfolder names | `01, 02` | Comma-separated subfolder names under the root |
-| Minimum hits (slowest table) | `20` | Minimum request count for an endpoint to appear in the slowest table |
-| Export CSV files | `N` | Whether to write results to CSV files in the root folder |
+| IIS log folder path | — | Path to the copied IIS log folder on this server |
+| Reports output folder | `<LogFolder>\Reports` | Where report transcripts and CSVs are saved |
+| Reports to run | `A` (all) | Select one, many, or all — see table below |
+| Minimum hits (slowest table) | `20` | Only shown when report `[5]` is selected |
+| Export CSV files | `N` | Whether to write results to timestamped CSV files |
 
-**Output Tables:**
-| # | Table | Description |
-|---|-------|-------------|
-| 1 | Traffic by Day | Daily request counts: Server01 vs Server02 vs Total |
-| 2 | Traffic by Hour | Hourly request counts: Server01 vs Server02 vs Total |
-| 3 | Status Categories | 2xx / 3xx / 4xx / 5xx breakdown per server |
-| 4 | Top 30 Failed Endpoints | Most failing normalized API paths and status code |
-| 5 | Top 30 Slowest Endpoints | Slowest normalized API paths by Avg / P95 / Max ms |
+**Report Selection:**
+| Key | Report | Description |
+|-----|--------|-------------|
+| `1` | Traffic by Day | Total request count per day |
+| `2` | Traffic by Hour | Total request count per hour |
+| `3` | Status Categories | 2xx / 3xx / 4xx / 5xx breakdown |
+| `4` | Top 30 Failed Endpoints | Most failing normalized API paths + status code |
+| `5` | Top 30 Slowest Endpoints | Slowest normalized API paths by Avg / P95 / Max ms |
+| `A` | All reports | Runs all 5 reports (default) |
+
+You can combine selections — e.g. enter `1,2` for day and hour traffic, or `3,4,5` for errors and performance.
+
+**Incremental runs:**
+| Behaviour | Detail |
+|-----------|--------|
+| First run | No state file exists — processes all log entries |
+| Subsequent runs | Reads last run timestamp — skips entries already processed |
+| File-level skip | Files not modified since last run are skipped entirely |
+| State file | Saved as `iis-lastrun-<SERVERNAME>.txt` in the reports folder |
+
+**Output files (all saved to the reports folder):**
+| File | Description |
+|------|-------------|
+| `iis-report-<SERVER>-<yyyyMMdd-HHmmss>.txt` | Full console transcript of the run |
+| `traffic_by_day-<SERVER>-<timestamp>.csv` | Report [1] CSV (if exported) |
+| `traffic_by_hour-<SERVER>-<timestamp>.csv` | Report [2] CSV (if exported) |
+| `status_categories-<SERVER>-<timestamp>.csv` | Report [3] CSV (if exported) |
+| `top_failed-<SERVER>-<timestamp>.csv` | Report [4] CSV (if exported) |
+| `slow_endpoints-<SERVER>-<timestamp>.csv` | Report [5] CSV (if exported) |
 
 **Notes:**
 - IIS log files must be in standard W3C format with a `#Fields:` header
-- Times in IIS logs are UTC by default
+- Log times are used as-is — no timezone conversion is applied
 - Azure Load Balancer Agent requests are excluded automatically
-- CSV files (if exported) are written to the root folder
+- URI segments are normalized: numbers → `{id}`, GUIDs → `{guid}`, long tokens → `{token}`
+- Run on each server independently — the state file is server-specific
