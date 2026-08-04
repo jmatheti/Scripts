@@ -2,21 +2,31 @@
 	Imports Aurion
 	Imports System.Xml
 	Imports System.Net
-	Imports System.Web.Services.Protocols
 	Imports System.ServiceModel
     Imports CCC_DAFF.Aurion.E397.ServiceProxy
 #End If
 
 
-Private Function ConfigureAurionTcpKeepAlive(ByVal serviceUrl As String) As String
-    Try
-        Dim serviceUri As New Uri(serviceUrl)
-        Dim servicePoint As ServicePoint = ServicePointManager.FindServicePoint(serviceUri)
-        servicePoint.SetTcpKeepAlive(True, 30000, 1000) ' 30sec idle, 1sec interval
-        Return $"TCP KeepAlive enabled for {serviceUri.Host}"
-    Catch ex As Exception
-        Return $"TCP KeepAlive configuration failed: {ex.Message}"
-    End Try
+''' <summary>
+''' Creates a configured EV397_AURION_WSPortTypeClient for the given endpoint URL and timeout.
+''' </summary>
+Private Function CreateAurionClient(ByVal serviceUrl As String, ByVal timeoutMs As Integer) As EV397_AURION_WSPortTypeClient
+    Dim binding As New BasicHttpBinding()
+    binding.MaxBufferSize = 2147483647
+    binding.MaxReceivedMessageSize = 2147483647
+    binding.AllowCookies = True
+    binding.Security.Mode = BasicHttpSecurityMode.Transport
+    binding.SendTimeout = TimeSpan.FromMilliseconds(timeoutMs)
+    binding.ReceiveTimeout = TimeSpan.FromMilliseconds(timeoutMs)
+    Dim endpoint As New EndpointAddress(serviceUrl)
+    Return New EV397_AURION_WSPortTypeClient(binding, endpoint)
+End Function
+
+''' <summary>
+''' Returns the Aurion service URL for the given importSource config key base.
+''' </summary>
+Private Function GetAurionServiceUrl(ByVal configBase As String) As String
+    Return Connection.GetConfigParm(configBase & "\ServiceUrl").ToString()
 End Function
 
 ''' <summary>
@@ -25,212 +35,91 @@ End Function
 ''' <param name="P_TOKEN">Token from CCC_Aurion_LOGON</param>
 ''' <param name="P_FUNCTION">Remote function</param>
 ''' <param name="P_DELIMITER">Delimiter - usually comma</param>
-''' <param name="P_PARAMETERS">Function parmeters</param>
+''' <param name="P_PARAMETERS">Function parameters</param>
+''' <param name="importSource">Import source identifier</param>
 ''' <returns>P_OUTPUT content</returns>
-''' 
 Public Function CCC_Aurion_CALLFUNCTION3(ByVal P_TOKEN As String, ByVal P_FUNCTION As String, ByVal P_DELIMITER As String, ByVal P_PARAMETERS As String, ByVal importSource As String) As String
-	Dim strReturnValue As String = String.Empty
-	Dim returnValue As Int32 = 0
-	Dim P_WRAPPER As String = String.Empty
-	Dim P_OUTPUT As String = String.Empty
-	Dim P_MESSAGE As String = String.Empty
-	Dim P_STATUS As Decimal = 0
-	Dim timeoutRetries As Decimal = 1
-	Try
-		timeoutRetry:
-		' create webservice class
-		If (importSource.Equals(Connection.GetConfigParm("Custom\AURION_DISR\ImportSource").ToString().ToUpper())) Then
-			Using ws As AurionDISR.EV397_AURION_WSService = VID_GetWebService(Of AurionDISR.EV397_AURION_WSService)()
-				ws.Timeout = 30000000
-				' call WebService
-				returnValue = ws.CALLFUNCTION3(P_TOKEN, P_FUNCTION, P_DELIMITER, P_WRAPPER, P_PARAMETERS, P_OUTPUT, P_MESSAGE, P_STATUS)
-				If returnValue = 0 And Not (P_OUTPUT Is Nothing) And P_MESSAGE Is Nothing Then
-					' api call success with output
-					strReturnValue = P_OUTPUT
-				ElseIf returnValue = 0 And Not (P_MESSAGE Is Nothing) Then
-					' api call success, but no output
-					strReturnValue = "Status: " & P_STATUS.ToString() & " Message: " & P_MESSAGE
-				ElseIf returnValue = 0 And P_MESSAGE Is Nothing And P_OUTPUT Is Nothing Then
-					strReturnValue = "Success"
-				Else
-					Dim wsMsgException As Exception = New Exception(P_MESSAGE)
-					Throw New ViException("AURION DISR - CALLFUNCTION3 - Error getting data", wsMsgException)
-				End If
-			End Using
-		Else If (importSource.Equals(Connection.GetConfigParm("Custom\AURION_DCCEEW\ImportSource").ToString().ToUpper())) Then
-			Using ws As AurionDCCEEW.EV397_AURION_WSService = VID_GetWebService(Of AurionDCCEEW.EV397_AURION_WSService)()
-				ws.Timeout = 30000000
-				' call WebService
-				returnValue = ws.CALLFUNCTION3(P_TOKEN, P_FUNCTION, P_DELIMITER, P_WRAPPER, P_PARAMETERS, P_OUTPUT, P_MESSAGE, P_STATUS)
-				If returnValue = 0 And Not (P_OUTPUT Is Nothing) And P_MESSAGE Is Nothing Then
-					' api call success with output
-					strReturnValue = P_OUTPUT
-				ElseIf returnValue = 0 And Not (P_MESSAGE Is Nothing) Then
-					' api call success, but no output
-					strReturnValue = "Status: " & P_STATUS.ToString() & " Message: " & P_MESSAGE
-				ElseIf returnValue = 0 And P_MESSAGE Is Nothing And P_OUTPUT Is Nothing Then
-					strReturnValue = "Success"
-				Else
-					Dim wsMsgException As Exception = New Exception(P_MESSAGE)
-					Throw New ViException("AURION DCCEEW - CALLFUNCTION3 - Error getting data", wsMsgException)
-				End If
-			End Using	
-		Else
-			Using ws As Aurion.EV397_AURION_WSService = VID_GetWebService(Of Aurion.EV397_AURION_WSService)()
-			    Dim keepAliveResult As String = ConfigureAurionTcpKeepAlive(ws.Url)
-                ' CCC_NLog_WriteLog("AURION_ESS_EMPLOYMENT", "Debug", $"Default - {keepAliveResult}") ' only enable for debugging, will write to employment log file
-				'ws.Timeout = 30000000
-				ws.Timeout = 600000
-				' call WebService
-				returnValue = ws.CALLFUNCTION3(P_TOKEN, P_FUNCTION, P_DELIMITER, P_WRAPPER, P_PARAMETERS, P_OUTPUT, P_MESSAGE, P_STATUS)
-				If returnValue = 0 And Not (P_OUTPUT Is Nothing) And P_MESSAGE Is Nothing Then
-					' api call success with output
-					strReturnValue = P_OUTPUT
-				ElseIf returnValue = 0 And Not (P_MESSAGE Is Nothing) Then
-					' api call success, but no output
-					strReturnValue = "Status: " & P_STATUS.ToString() & " Message: " & P_MESSAGE
-				ElseIf returnValue = 0 And P_MESSAGE Is Nothing And P_OUTPUT Is Nothing Then
-					strReturnValue = "Success"
-				Else
-					Dim wsMsgException As Exception = New Exception(P_MESSAGE)
-					Throw New ViException("AURION - CALLFUNCTION3 - Error getting data", wsMsgException)
-				End If
-			End Using
-		End If
-	Catch ex As Exception
-		' Determine if The operation has timed out
-		If ex.Message.Contains("The operation has timed out") And timeoutRetries > 0 Then
-			timeoutRetries = timeoutRetries - 1
-			GoTo timeoutRetry
-		Else
-			Throw New ViException("AURION - CALLFUNCTION3 - Error getting data", ex)
-		End If
-	End Try
-	Return strReturnValue
+    Dim strReturnValue As String = String.Empty
+    Dim timeoutRetries As Decimal = 1
+    Dim configBase As String = CCC_Aurion_GetConfigBase(importSource)
+    Dim serviceUrl As String = GetAurionServiceUrl(configBase)
+    Try
+        timeoutRetry:
+        Using ws As EV397_AURION_WSPortTypeClient = CreateAurionClient(serviceUrl, 600000)
+            Dim request As New CALLFUNCTION3Request(P_TOKEN, P_FUNCTION, P_DELIMITER, String.Empty, P_PARAMETERS)
+            Dim response As CALLFUNCTION3Response = ws.CALLFUNCTION3Async(request).GetAwaiter().GetResult()
+            Dim returnValue As Integer = response.return
+            Dim P_OUTPUT As String = response.P_OUTPUT
+            Dim P_MESSAGE As String = response.P_MESSAGE
+            Dim P_STATUS As Decimal = response.P_STATUS
+            If returnValue = 0 AndAlso Not (P_OUTPUT Is Nothing) AndAlso P_MESSAGE Is Nothing Then
+                strReturnValue = P_OUTPUT
+            ElseIf returnValue = 0 AndAlso Not (P_MESSAGE Is Nothing) Then
+                strReturnValue = "Status: " & P_STATUS.ToString() & " Message: " & P_MESSAGE
+            ElseIf returnValue = 0 AndAlso P_MESSAGE Is Nothing AndAlso P_OUTPUT Is Nothing Then
+                strReturnValue = "Success"
+            Else
+                Dim wsMsgException As Exception = New Exception(P_MESSAGE)
+                Throw New ViException("AURION - CALLFUNCTION3 - Error getting data", wsMsgException)
+            End If
+        End Using
+    Catch ex As Exception
+        If ex.Message.Contains("The operation has timed out") And timeoutRetries > 0 Then
+            timeoutRetries = timeoutRetries - 1
+            GoTo timeoutRetry
+        Else
+            Throw New ViException("AURION - CALLFUNCTION3 - Error getting data", ex)
+        End If
+    End Try
+    Return strReturnValue
 End Function
 
 ''' <summary>
 ''' Aurion Web Service Logoff
 ''' </summary>
 ''' <param name="P_TOKEN">Token</param>
-''' 
+''' <param name="importSource">Import source identifier</param>
 Public Sub CCC_Aurion_LOGOFF(P_TOKEN As String, ByVal importSource As String)
-	If (importSource.Equals(Connection.GetConfigParm("Custom\AURION_DISR\ImportSource").ToString().ToUpper())) Then
-		' create webservice class
-		Using ws As AurionDISR.EV397_AURION_WSService = VID_GetWebService(Of AurionDISR.EV397_AURION_WSService)()
-			Dim returnValue As Int32
-			' call WebService
-			returnValue = ws.LOGOFF(P_TOKEN)
-		End Using
-	Else If (importSource.Equals(Connection.GetConfigParm("Custom\AURION_DCCEEW\ImportSource").ToString().ToUpper())) Then
-		' create webservice class
-		Using ws As AurionDCCEEW.EV397_AURION_WSService = VID_GetWebService(Of AurionDCCEEW.EV397_AURION_WSService)()
-			Dim returnValue As Int32
-			' call WebService
-			returnValue = ws.LOGOFF(P_TOKEN)
-		End Using	
-	Else
-		' create webservice class
-		Using ws As Aurion.EV397_AURION_WSService = VID_GetWebService(Of Aurion.EV397_AURION_WSService)()
-			Dim returnValue As Int32
-			' call WebService
-			returnValue = ws.LOGOFF(P_TOKEN)
-		End Using
-	End If
+    Dim configBase As String = CCC_Aurion_GetConfigBase(importSource)
+    Dim serviceUrl As String = GetAurionServiceUrl(configBase)
+    Using ws As EV397_AURION_WSPortTypeClient = CreateAurionClient(serviceUrl, 30000)
+        ws.LOGOFFAsync(P_TOKEN).GetAwaiter().GetResult()
+    End Using
 End Sub
 
 ''' <summary>
 ''' Aurion Web Service Logon
 ''' </summary>
+''' <param name="importSource">Import source identifier</param>
 ''' <returns>Token</returns>
-''' 
 Public Function CCC_Aurion_LOGON(ByVal importSource As String) As String
-	Dim strRtnValue As String = String.Empty
-	Try
-		If (importSource.Equals(Connection.GetConfigParm("Custom\AURION_DISR\ImportSource").ToString().ToUpper())) Then
-			' create webservice class
-			Using ws As AurionDISR.EV397_AURION_WSService = VID_GetWebService(Of AurionDISR.EV397_AURION_WSService)()
-				Dim returnValue As Int32
-				Dim P_USER As String = Connection.GetConfigParm("Custom\AURION_DISR\Username")
-				Dim configPwd As String = Connection.GetConfigParm("Custom\AURION_DISR\Password")
-				Dim P_PASSWORD As String = String.Empty
-				' Decrypt Config Parameter
-				If configPwd.StartsWith("[C]") Then
-					P_PASSWORD = Session.Decrypt(configPwd)
-				Else
-					P_PASSWORD = configPwd
-				End If
-				Dim P_TOKEN As String = String.Empty
-				Dim P_MESSAGE As String = String.Empty
-				Dim P_STATUS As Decimal
-				' call WebService
-				returnValue = ws.LOGON(P_USER, P_PASSWORD, P_TOKEN, P_MESSAGE, P_STATUS)
-				If returnValue = 0 Then
-					strRtnValue = P_TOKEN
-				Else
-					' authentication error...
-					Dim wsMsgException As Exception = New Exception(P_MESSAGE)
-					Throw New ViException("AURION DISR - LOGON - web service auth error", wsMsgException)
-				End If
-			End Using
-		Else If (importSource.Equals(Connection.GetConfigParm("Custom\AURION_DCCEEW\ImportSource").ToString().ToUpper())) Then
-			' create webservice class
-			Using ws As AurionDCCEEW.EV397_AURION_WSService = VID_GetWebService(Of AurionDCCEEW.EV397_AURION_WSService)()
-				Dim returnValue As Int32
-				Dim P_USER As String = Connection.GetConfigParm("Custom\AURION_DCCEEW\Username")
-				Dim configPwd As String = Connection.GetConfigParm("Custom\AURION_DCCEEW\Password")
-				Dim P_PASSWORD As String = String.Empty
-				' Decrypt Config Parameter
-				If configPwd.StartsWith("[C]") Then
-					P_PASSWORD = Session.Decrypt(configPwd)
-				Else
-					P_PASSWORD = configPwd
-				End If
-				Dim P_TOKEN As String = String.Empty
-				Dim P_MESSAGE As String = String.Empty
-				Dim P_STATUS As Decimal
-				' call WebService
-				returnValue = ws.LOGON(P_USER, P_PASSWORD, P_TOKEN, P_MESSAGE, P_STATUS)
-				If returnValue = 0 Then
-					strRtnValue = P_TOKEN
-				Else
-					' authentication error...
-					Dim wsMsgException As Exception = New Exception(P_MESSAGE)
-					Throw New ViException("AURION DCCEEW - LOGON - web service auth error", wsMsgException)
-				End If
-			End Using	
-		Else
-			' create webservice class
-			Using ws As Aurion.EV397_AURION_WSService = VID_GetWebService(Of Aurion.EV397_AURION_WSService)()
-				Dim returnValue As Int32
-				Dim P_USER As String = Connection.GetConfigParm("Custom\AURION\Username")
-				Dim configPwd As String = Connection.GetConfigParm("Custom\AURION\Password")
-				Dim P_PASSWORD As String = String.Empty
-				' Decrypt Config Parameter
-				If configPwd.StartsWith("[C]") Then
-					P_PASSWORD = Session.Decrypt(configPwd)
-				Else
-					P_PASSWORD = configPwd
-				End If
-				Dim P_TOKEN As String = String.Empty
-				Dim P_MESSAGE As String = String.Empty
-				Dim P_STATUS As Decimal
-				' call WebService
-				returnValue = ws.LOGON(P_USER, P_PASSWORD, P_TOKEN, P_MESSAGE, P_STATUS)
-				If returnValue = 0 Then
-					strRtnValue = P_TOKEN
-				Else
-					' authentication error...
-					Dim wsMsgException As Exception = New Exception(P_MESSAGE)
-					Throw New ViException("AURION - LOGON - web service auth error", wsMsgException)
-				End If
-			End Using
-		End If
-	Catch ex As Exception
-		Throw New ViException("AURION - LOGON - web service auth error-", ex)
-	End Try
-	
-	Return strRtnValue
+    Dim strRtnValue As String = String.Empty
+    Dim configBase As String = CCC_Aurion_GetConfigBase(importSource)
+    Dim serviceUrl As String = GetAurionServiceUrl(configBase)
+    Try
+        Dim P_USER As String = Connection.GetConfigParm(configBase & "\Username")
+        Dim configPwd As String = Connection.GetConfigParm(configBase & "\Password")
+        Dim P_PASSWORD As String = String.Empty
+        ' Decrypt Config Parameter
+        If configPwd.StartsWith("[C]") Then
+            P_PASSWORD = Session.Decrypt(configPwd)
+        Else
+            P_PASSWORD = configPwd
+        End If
+        Using ws As EV397_AURION_WSPortTypeClient = CreateAurionClient(serviceUrl, 30000)
+            Dim request As New LOGONRequest(P_USER, P_PASSWORD)
+            Dim response As LOGONResponse = ws.LOGONAsync(request).GetAwaiter().GetResult()
+            If response.return = 0 Then
+                strRtnValue = response.P_TOKEN
+            Else
+                Dim wsMsgException As Exception = New Exception(response.P_MESSAGE)
+                Throw New ViException("AURION - LOGON - web service auth error", wsMsgException)
+            End If
+        End Using
+    Catch ex As Exception
+        Throw New ViException("AURION - LOGON - web service auth error-", ex)
+    End Try
+    Return strRtnValue
 End Function
 
 ''' <summary>
@@ -238,7 +127,6 @@ End Function
 ''' </summary>
 ''' <param name="lastChr">Character to estimate next value</param>
 ''' <returns>Next Char</returns>
-''' 
 Public Function CCC_Aurion_NextValue(ByVal lastChr As Char) As Char
 	Select Case lastChr.ToString()
 		Case "0"
@@ -317,16 +205,9 @@ End Function
 ''' <summary>
 ''' Perform multiple queries and combine into single XML string
 ''' </summary>
-''' <param name="loggerName">Name of the NLog to write to</param>
-''' <param name="P_TOKEN">P_TOKEN for authentication</param>
-''' <param name="QUERY_ID">P_PARAMETERS QUERY_ID</param>
-''' <param name="FILTERS">P_PARAMETERS FILTERs with separators of # for groups and | for low/hi filter</param>
-''' <returns>Xml.XmlDocument as String</returns>
-''' 
 Public Function CCC_Aurion_QUERY_TO_XML(ByVal loggerName As String, ByVal P_TOKEN As String, ByVal QUERY_ID As String, ByVal FILTERS As String, ByVal importSource As String) As String
 	Dim configBase As String = CCC_Aurion_GetConfigBase(importSource)
 	CCC_NLog_WriteLog(loggerName, "Debug", "Entering CCC_Aurion_Queries_To_XML()")
-	' Prepare Variables
 	Dim strXMLDocument As String = String.Empty
 	Dim strEmptyDoc As String = String.Empty
 	Dim xmlDocCombined As Xml.XmlDocument = New Xml.XmlDocument
@@ -339,9 +220,7 @@ Public Function CCC_Aurion_QUERY_TO_XML(ByVal loggerName As String, ByVal P_TOKE
 	Dim P_PARAMETERS As String = "QUERY_ID=" & QUERY_ID & "{0}" & P_DELIMITER & "RETURN_XML=T"
 	Dim parametersFilter As String = String.Empty
 	
-	' Determine filters to run
 	Dim filtersMap As String() = FILTERS.Split(New Char(){"#"c}, StringSplitOptions.RemoveEmptyEntries)
-	' Run first Query
 	If filtersMap.Length > 0 Then
 		filterMap = filtersMap(0).ToString().Split(New Char(){"|"c}, StringSplitOptions.RemoveEmptyEntries)
 		If filterMap.Length > 0 Then
@@ -369,7 +248,6 @@ Public Function CCC_Aurion_QUERY_TO_XML(ByVal loggerName As String, ByVal P_TOKE
 			RaiseMessage(MsgSeverity.Info, "Error loading XML. Aurion API Query output: " & strXMLDocument)
 		End Try
 	End If
-	' Loop other queries
 	If filtersMap.Length > 1 Then
 		For counter As Integer = 1 To (filtersMap.Length - 1)
 			parametersFilter = String.Empty
@@ -381,12 +259,9 @@ Public Function CCC_Aurion_QUERY_TO_XML(ByVal loggerName As String, ByVal P_TOKE
 					parametersFilter = parametersFilter & P_DELIMITER & "FILTER_HI=" & filterMap(1).ToString()
 				End If
 			End If
-			' 5 second sleep between calls
 			CCC_NLog_WriteLog(loggerName, "Debug", "Waiting 5000 milliseconds")
 			Threading.Thread.Sleep(5000)
-			
 			CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_CALLFUNCTION3(P_TOKEN, """ & P_FUNCTION & """, """ & P_DELIMITER & """, """ & String.Format(P_PARAMETERS, parametersFilter) & """)")
-
 			strXMLDocument = CCC_Aurion_CALLFUNCTION3(P_TOKEN, P_FUNCTION, P_DELIMITER, String.Format(P_PARAMETERS, parametersFilter), importSource)
 			CCC_NLog_WriteLog(loggerName, "Trace", "Result: " & strXMLDocument.ToString())
 			If strXMLDocument = Connection.GetConfigParm(configBase & "\NoRecordsOutput") Then
@@ -401,29 +276,21 @@ Public Function CCC_Aurion_QUERY_TO_XML(ByVal loggerName As String, ByVal P_TOKE
 					strErrorMsg.AppendLine(ex.Message())
 					CCC_NLog_WriteLog(loggerName, "Fatal", strErrorMsg.ToString())
 					RaiseMessage(MsgSeverity.Info, "Error loading XML. Aurion API Query output: " & strXMLDocument)
-					
-					' 03/10/2022 - Brian Pack - Rethrow Exception - Stop All Execution
 					Throw ex
 				End Try
-				' Check for duplicate if using overlapping boundaries on queries
 				Dim swx As IO.StringWriter = New IO.StringWriter()
 				Dim xwx As Xml.XmlTextWriter = New Xml.XmlTextWriter(swx)
 				xmlDocCombined.DocumentElement.LastChild.WriteTo(xwx)
 				Dim prevNode As String = swx.ToString()
-				
 				swx  = New IO.StringWriter()
 				xwx  = New Xml.XmlTextWriter(swx)
 				xmlDocLoop.DocumentElement.FirstChild.WriteTo(xwx)
 				Dim nextNode As String = swx.ToString()
-				'CCC_NLog_WriteLog(loggerName, "Trace", "XML Duplicate Check: prevNode " & prevNode)
-				'CCC_NLog_WriteLog(loggerName, "Trace", "XML Duplicate Check: nextNode " & nextNode)
 				If String.Equals(prevNode, nextNode) Then
 					CCC_NLog_WriteLog(loggerName, "Trace", "XML Duplicate From Filter Query Range Identified")
 					CCC_NLog_WriteLog(loggerName, "Trace", "XML Duplicate Removed: " & nextNode)
 					xmlDocLoop.DocumentElement.RemoveChild(xmlDocLoop.DocumentElement.FirstChild)
 				End If
-				
-				' Add query nodes to original document.
 				For Each nod As Xml.XmlNode In xmlDocLoop.DocumentElement.ChildNodes
 					Dim tmpNod As Xml.XmlNode = xmlDocCombined.ImportNode(nod, True)
 					xmlDocCombined.DocumentElement.AppendChild(tmpNod)				
@@ -434,7 +301,6 @@ Public Function CCC_Aurion_QUERY_TO_XML(ByVal loggerName As String, ByVal P_TOKE
 	If Not String.IsNullOrEmpty(strEmptyDoc) Then
 		CCC_NLog_WriteLog(loggerName, "Debug", "A query returned an empty document: " & strEmptyDoc.ToString())
 	End If
-	' End function and return document
 	xmlDocCombined.WriteTo(xw)
 	CCC_NLog_WriteLog(loggerName, "Trace", "Combined Document: " & sw.ToString())
 	CCC_NLog_WriteLog(loggerName & "_XML", "Trace", "Combined Document: " & sw.ToString())
@@ -451,7 +317,6 @@ End Function
 Public Function CCC_Aurion_GetLoggerPrefix(ByVal importSource As String) As String
 	Dim configBase As String = CCC_Aurion_GetConfigBase(importSource)
 	Dim loggerPrefix As String = "AURION_ESS"
-	
 	If Not (String.IsNullOrEmpty(Connection.GetConfigParm(configBase & "\LoggerPrefix"))) Then
 		loggerPrefix = Connection.GetConfigParm(configBase & "\LoggerPrefix").ToString()
 	End If
@@ -463,72 +328,39 @@ Public Function CCC_Aurion_GetConfigBase(ByVal importSource As String) As String
 	If (String.IsNullOrEmpty(translation)) Then
 		translation = Connection.GetConfigParm("Custom\AURION_IMPORTSOURCE\AUR").ToString().ToUpper()
 	End If
-	
 	Return "Custom\" & translation
 End Function
 
 ' 15/08/2023 - Brian Pack - For Testing/Diagnostic Purposes Only
-' Example parameters: QUERY_ID=IAM_EMPLOYMENT,FILTER=T001F005_EMPLOYEE_NO.T001_BASIC_DETAILS=10002,FILTER_HI=T001F005_EMPLOYEE_NO.T001_BASIC_DETAILS=10004,RETURN_XML=T
 Public Function CCC_Aurion_Direct_Query_Harness(ByVal importSource As String, ByVal username As String, ByVal password As String, ByVal P_PARAMETERS As String, ByVal log As String) As String
-	Dim file As System.IO.StreamWriter = System.IO.File.AppendText(log)
+    Dim file As System.IO.StreamWriter = System.IO.File.AppendText(log)
+    Dim strReturnValue As String = String.Empty
+    Dim configBase As String = CCC_Aurion_GetConfigBase(importSource)
+    Dim serviceUrl As String = GetAurionServiceUrl(configBase)
 
-	' LOGON
-	Dim returnValue As Int32 = 0
-	Dim P_TOKEN As String = String.Empty
-	Dim P_MESSAGE As String = String.Empty
-	Dim P_STATUS As Decimal = 0
-	
-	' Call 3
-	Dim strReturnValue As String = String.Empty
-	
-	Dim P_WRAPPER As String = String.Empty
-	Dim P_OUTPUT As String = String.Empty
-	
-	
-	If (importSource.Equals(Connection.GetConfigParm("Custom\AURION_DISR\ImportSource").ToString().ToUpper())) Then
-		Using ws As AurionDISR.EV397_AURION_WSService = VID_GetWebService(Of AurionDISR.EV397_AURION_WSService)()
-		End Using
-			
-	Else If (importSource.Equals(Connection.GetConfigParm("Custom\AURION_DCCEEW\ImportSource").ToString().ToUpper())) Then
-		Using ws As AurionDCCEEW.EV397_AURION_WSService = VID_GetWebService(Of AurionDCCEEW.EV397_AURION_WSService)()
-			ws.Timeout = 30000000
-			returnValue = ws.LOGON(username, password, P_TOKEN, P_MESSAGE, P_STATUS)
-			
-			If returnValue = 0 Then
-				
-				ws.CALLFUNCTION3(P_TOKEN, "QUERY_TO_XML", ",", P_WRAPPER, P_PARAMETERS, P_OUTPUT, P_MESSAGE, P_STATUS)
-				If returnValue = 0 And Not (P_OUTPUT Is Nothing) And P_MESSAGE Is Nothing Then
-					' api call success with output
-					strReturnValue = "Status Output: " & P_OUTPUT
-				ElseIf returnValue = 0 And Not (P_MESSAGE Is Nothing) Then
-					' api call success, but no output
-					strReturnValue = "Status: " & P_STATUS.ToString() & " Message: " & P_MESSAGE
-				ElseIf returnValue = 0 And P_MESSAGE Is Nothing And P_OUTPUT Is Nothing Then
-					strReturnValue = "Success"
-				Else
-					strReturnValue = "Error"
-					Dim wsMsgException As Exception = New Exception(P_MESSAGE)
-					Throw New ViException("AURION DCCEEW - CALLFUNCTION3 - Error getting data", wsMsgException)
-				End If	
-			Else
-				' authentication error...
-				Dim wsMsgException As Exception = New Exception(P_MESSAGE)
-				Throw New ViException("AURION DCCEEW - LOGON - web service auth error", wsMsgException)
-			End If
-			
-			
-		End Using	
-	Else
-		' create webservice class
-		Using ws As Aurion.EV397_AURION_WSService = VID_GetWebService(Of Aurion.EV397_AURION_WSService)()
-		End Using
-	End If
-	
-	file.WriteLine(strReturnValue)
-	file.Close()
+    Using ws As EV397_AURION_WSPortTypeClient = CreateAurionClient(serviceUrl, 30000000)
+        Dim logonRequest As New LOGONRequest(username, password)
+        Dim logonResponse As LOGONResponse = ws.LOGONAsync(logonRequest).GetAwaiter().GetResult()
+        If logonResponse.return = 0 Then
+            Dim P_TOKEN As String = logonResponse.P_TOKEN
+            Dim callRequest As New CALLFUNCTION3Request(P_TOKEN, "QUERY_TO_XML", ",", String.Empty, P_PARAMETERS)
+            Dim callResponse As CALLFUNCTION3Response = ws.CALLFUNCTION3Async(callRequest).GetAwaiter().GetResult()
+            If callResponse.return = 0 AndAlso Not (callResponse.P_OUTPUT Is Nothing) AndAlso callResponse.P_MESSAGE Is Nothing Then
+                strReturnValue = "Status Output: " & callResponse.P_OUTPUT
+            ElseIf callResponse.return = 0 AndAlso Not (callResponse.P_MESSAGE Is Nothing) Then
+                strReturnValue = "Status: " & callResponse.P_STATUS.ToString() & " Message: " & callResponse.P_MESSAGE
+            ElseIf callResponse.return = 0 AndAlso callResponse.P_MESSAGE Is Nothing AndAlso callResponse.P_OUTPUT Is Nothing Then
+                strReturnValue = "Success"
+            Else
+                strReturnValue = "Error"
+                Throw New ViException("AURION - CALLFUNCTION3 - Error getting data", New Exception(callResponse.P_MESSAGE))
+            End If
+        Else
+            Throw New ViException("AURION - LOGON - web service auth error", New Exception(logonResponse.P_MESSAGE))
+        End If
+    End Using
 
-	Return strReturnValue
-
-
+    file.WriteLine(strReturnValue)
+    file.Close()
+    Return strReturnValue
 End Function
-
