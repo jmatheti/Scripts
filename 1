@@ -1,0 +1,44 @@
+
+' Domain Calculation
+Public Function CCC_Person_Domain(ByVal company As String, ByVal Org_FullPath As String, ByVal importSource As String) As String
+	Dim domainConfigParamBase As String = "Custom\ActiveDirectory\NamingStandards\UPNDomain\"
+	Dim domainMappingParamBase As String = "Custom\ActiveDirectory\NamingStandards\UPNDomainOUMapping\"
+
+	Dim domainMapping As String = ""
+	If Not String.IsNullOrEmpty(Org_FullPath) Then
+		Dim startIdx As Integer = Org_FullPath.IndexOf("("c) + 1
+		Dim len As Integer = Org_FullPath.IndexOf(")"c) - startIdx 
+		Dim ou As String = Org_FullPath.Substring(startIdx, len)
+		domainMapping = Connection.GetConfigParm(domainMappingParamBase & ou).ToString()
+	End If
+	
+	Dim domain As String = ""
+	If Not String.IsNullOrEmpty(domainMapping) Then
+		domain = domainMapping
+	ElseIf Not String.IsNullOrEmpty(company) Then
+		domain = Connection.GetConfigParm(domainConfigParamBase & company).ToString()
+	ElseIf Not String.IsNullOrEmpty(Org_FullPath) Then
+		If Org_FullPath.Contains("(") Then
+			Org_FullPath = Org_FullPath.Substring(0, Org_FullPath.IndexOf("("c))
+		End If
+		
+		Dim orgPath As String() = Org_FullPath.Split("\"c)
+		Dim depth As Int32 = Convert.ToInt32(Connection.GetConfigParm(domainConfigParamBase & "org_depth").ToString())
+		
+		If orgPath.Count >= depth Then
+			domain = Connection.GetConfigParm(domainConfigParamBase & orgPath(depth - 1)).ToString()
+		End If
+	End If
+		
+	If String.IsNullOrEmpty(domain) Then
+		Dim configBase As String = CCC_Aurion_GetConfigBase(importSource)
+		Dim defaultDomain As String = Connection.GetConfigParm(configBase & "\DefaultEmailDomain").ToString()
+		If String.IsNullOrEmpty(defaultDomain) Then
+			domain = Connection.GetConfigParm(domainConfigParamBase & "default").ToString()
+		Else
+			domain = defaultDomain
+		End If
+	End If
+
+	Return domain
+End Function
