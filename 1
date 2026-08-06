@@ -25,7 +25,7 @@ Public Function CCC_Person_Domain(ByVal company As String, ByVal Org_FullPath As
 		Dim orgPath As String() = Org_FullPath.Split("\"c)
 		Dim depth As Int32 = Convert.ToInt32(Connection.GetConfigParm(domainConfigParamBase & "org_depth").ToString())
 		
-		If orgPath.Count >= depth Then
+		If orgPath.Length >= depth Then
 			domain = Connection.GetConfigParm(domainConfigParamBase & orgPath(depth - 1)).ToString()
 		End If
 	End If
