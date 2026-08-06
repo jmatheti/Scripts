@@ -38,7 +38,7 @@ Public Function CCC_AE_CreatedefaultMailAddress(ByVal PreferredName As String, B
 	' BP - Check Current Primary Email (if exists)
 	Dim mailCurrent As String = Connection.GetSingleProperty("Person", "DefaultEmailAddress", String.Format("UID_Person='{0}'", uidperson)).ToString()
 	If Not String.IsNullOrEmpty(mailCurrent) Then
-		Dim mailLocked As Boolean = Convert.ToBoolean(Connection.GetSingleProperty("Person", "CCC_EmailLocked", String.Format("UID_Person='{0}'", uidperson)))
+		Dim mailLocked As Boolean = Convert.ToBoolean(Connection.GetSingleProperty("Person", "CCC_EmailLocked", String.Format("UID_Person='{0}'", uidperson)).ToString())
 		If mailLocked Then
 			Return mailCurrent
 		End If
