@@ -19,7 +19,6 @@ Public Function CCC_AE_CreatedefaultMailAddress(ByVal PreferredName As String, B
 	Dim prefix As String = account
 	Dim maildom As String = String.Empty
 	Dim f As ISqlFormatter = Connection.SqlFormatter
-	CCC_AE_CreatedefaultMailAddress = String.Empty
 	
 	' BP - New Domain Calculation
 	' 9/6/2023 - Addition of importsource based default domain
@@ -29,7 +28,7 @@ Public Function CCC_AE_CreatedefaultMailAddress(ByVal PreferredName As String, B
 	'maildom = Connection.GetConfigParm("Custom\Environment\EmailDomainPrefix") & Connection.GetConfigParm("QER\Person\DefaultMailDomain")
 	maildom = Connection.GetConfigParm("Custom\Environment\EmailDomainPrefix") & CCC_Person_Domain(company, org_FullPath, importSource)
 	If maildom = "" Then
-		Exit Function
+		Return String.Empty
 	Else
 		If Not maildom.StartsWith("@") Then
 			maildom = "@" & maildom
@@ -39,7 +38,7 @@ Public Function CCC_AE_CreatedefaultMailAddress(ByVal PreferredName As String, B
 	' BP - Check Current Primary Email (if exists)
 	Dim mailCurrent As String = Connection.GetSingleProperty("Person", "DefaultEmailAddress", String.Format("UID_Person='{0}'", uidperson)).ToString()
 	If Not String.IsNullOrEmpty(mailCurrent) Then
-		Dim mailLocked As Boolean = Connection.GetSingleProperty("Person", "CCC_EmailLocked", String.Format("UID_Person='{0}'", uidperson)).Bool
+		Dim mailLocked As Boolean = Convert.ToBoolean(Connection.GetSingleProperty("Person", "CCC_EmailLocked", String.Format("UID_Person='{0}'", uidperson)))
 		If mailLocked Then
 			Return mailCurrent
 		End If
@@ -192,7 +191,7 @@ End Function
 
 Public Function CCC_AE_CreatedefaultMailAddress_NameChangeExist(ByVal email As String, ByVal uid_person As String) As Boolean
 	Dim whereClause As String = "CCC_DefaultEmailAddress like '" & email.Substring(0, email.IndexOf("@"c)) & "%'"
-	If String.IsNullOrEmpty(uid_person) Then
+	If Not String.IsNullOrEmpty(uid_person) Then
 		whereClause = whereClause & " AND NOT uid_person = '" & uid_person & "'"
 	End If
 	
