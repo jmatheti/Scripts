@@ -1,0 +1,200 @@
+#If Not SCRIPTDEBUGGER Then
+	Imports System.Collections.Generic
+	Imports System.Data
+#End If
+' 06/09/2022 - BP - Update to how domain suffix is calculated. Allows for more configurable domains.
+
+''' <summary>
+''' Return the default email address
+''' </summary>
+''' <param name="PreferredName">Person.PreferredName</param>
+''' <param name="LastName">Person.LastName</param>
+''' <param name="uidperson">Person.UID_Person</param>
+''' <returns>Default Email Address</returns>
+Public Function CCC_AE_CreatedefaultMailAddress(ByVal PreferredName As String, ByVal LastName As String, ByVal uidperson As String, ByVal company As String, ByVal org_FullPath As String, Optional ByVal importSource As String = "") As String
+	Dim i As Int32 = 0
+	PreferredName = CCC_AE_FormatConvertUmlaut_Sonderzeichen_DefaultEmailAddress(PreferredName)
+	LastName = CCC_AE_FormatConvertUmlaut_Sonderzeichen_DefaultEmailAddress(LastName)
+	Dim account As String = Connection.GetConfigParm("Custom\Environment\CentralAccountPrefix") & PreferredName & "." & LastName
+	Dim prefix As String = account
+	Dim maildom As String = String.Empty
+	Dim f As ISqlFormatter = Connection.SqlFormatter
+	CCC_AE_CreatedefaultMailAddress = String.Empty
+	
+	' BP - New Domain Calculation
+	' 9/6/2023 - Addition of importsource based default domain
+	If String.IsNullOrEmpty(importSource) Then
+		importSource = Connection.GetSingleProperty("Person","importSource",String.Format("UID_Person = '{0}'", uidperson))
+	End If
+	'maildom = Connection.GetConfigParm("Custom\Environment\EmailDomainPrefix") & Connection.GetConfigParm("QER\Person\DefaultMailDomain")
+	maildom = Connection.GetConfigParm("Custom\Environment\EmailDomainPrefix") & CCC_Person_Domain(company, org_FullPath, importSource)
+	If maildom = "" Then
+		Exit Function
+	Else
+		If Not maildom.StartsWith("@") Then
+			maildom = "@" & maildom
+		End If
+	End If
+	
+	' BP - Check Current Primary Email (if exists)
+	Dim mailCurrent As String = Connection.GetSingleProperty("Person", "DefaultEmailAddress", String.Format("UID_Person='{0}'", uidperson)).ToString()
+	If Not String.IsNullOrEmpty(mailCurrent) Then
+		Dim mailLocked As Boolean = Connection.GetSingleProperty("Person", "CCC_EmailLocked", String.Format("UID_Person='{0}'", uidperson)).Bool
+		If mailLocked Then
+			Return mailCurrent
+		End If
+		
+		Dim delim As Integer = mailCurrent.IndexOf("@"c)
+		Dim prefixCurrent As String = mailCurrent.Substring(0, delim)
+		Dim domainCurrent As String = mailCurrent.Substring(delim, mailCurrent.Length - delim)
+		
+		' If no domain data was given, don't change domain
+		If String.IsNullOrEmpty(company) And String.IsNullOrEmpty(org_FullPath) Then
+			maildom = domainCurrent
+		End If
+		
+		' Return Current Primary
+		If prefixCurrent.StartsWith(account, StringComparison.InvariantCultureIgnoreCase) Then
+			Return prefixCurrent & maildom
+		End If
+	End If
+	
+	' fill existing addresses in a dictionary
+	Dim linkedEntry As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+	Dim unlinkedEntry As New Dictionary(Of String, Object)(StringComparer.OrdinalIgnoreCase)
+
+	Dim dummy As New Object()
+	Dim dummyPerson As ISingleDbObject
+	dummyPerson = Connection.CreateSingle("Person")
+	
+	' 19/11/2022 - BP - Remove Domain from filter to search across all domains
+	' Dim pattern As String = prefix & "%" & maildom
+	Dim pattern As String = prefix & "%"
+	'06/06/23 -  Asif Ahmed - Config param to include Only allowed domain
+	Dim allowedDomains As String() = Connection.GetConfigParm("Custom\ActiveDirectory\NamingStandards\AllowedDomains").Split(New Char(){","c}, StringSplitOptions.RemoveEmptyEntries)
+			
+	Using rd As IDataReader = CType(dummyPerson.Custom.CallMethod("SearchMailAddresses", pattern), IDataReader)
+		While rd.Read()
+			Dim address As String
+			Dim smtpAddress As String
+			Dim objectKeyString As String
+					
+			' 25/10/22 - Brian Pack - Only Compare Prefix
+			'address = rd.GetString(rd.GetOrdinal("smtp"))
+			smtpAddress = rd.GetString(rd.GetOrdinal("smtp")).ToString()
+			'06/06/23 -  Asif Ahmed - Only allow domain which is in the config param
+			If  allowedDomains.Contains(smtpAddress.Substring(smtpAddress.IndexOf("@"c)+1, smtpAddress.Length-smtpAddress.IndexOf("@"c)-1), StringComparer.InvariantCultureIgnoreCase) Then
+				address = smtpAddress.Substring(0, smtpAddress.IndexOf("@"c))
+				objectKeyString = rd.GetString(rd.GetOrdinal("ObjectKeyPerson"))
+				If Not String.IsNullOrEmpty(objectKeyString) Then
+					linkedEntry(address) = objectKeyString 
+				Else
+					unlinkedEntry(address) = dummy
+				End If
+			End If	
+		End While
+	End Using
+	
+	Dim myObjectKey As New DbObjectKey("Person", uidperson)
+	Dim objectKey As DbObjectKey
+	
+	' 20/11/2022 - BP - Firstly Check For an Existing smtp Allocation
+	Dim currentEmailPrefix As String = ""	
+	If linkedEntry.ContainsValue(myObjectKey.ToString) Then
+		For Each entry In linkedEntry
+			If entry.Value.toString().equals(myObjectKey.ToString) Then
+				currentEmailPrefix = entry.Key.toString()
+				If currentEmailPrefix.StartsWith(account, StringComparison.InvariantCultureIgnoreCase) Then
+					Return currentEmailPrefix & maildom
+				End If
+			End If
+		Next
+	End If	
+	
+	While True
+		Dim defaultemailaddress As String = account & maildom
+		
+		' 25/10/22 - Brian Pack - Only Compare Prefix
+		'If linkedEntry.ContainsKey(defaultemailaddress) Then
+		If linkedEntry.ContainsKey(account) Then
+			'objectKey = New DbObjectKey(linkedEntry(defaultemailaddress))
+			objectKey = New DbObjectKey(linkedEntry(account))
+			If myObjectKey.equals(objectKey) Then
+				Return defaultemailaddress
+			End If
+		'Else If Not unlinkedEntry.ContainsKey(defaultemailaddress) Then
+		Else If Not unlinkedEntry.ContainsKey(account) Then
+			Return defaultemailaddress
+		End If
+
+		' next trial
+		i = i + 1
+		' 07/10/2022 - Brian Pack - Restrict use of 69 number
+		If i = 69 Then
+			i = i + 1
+		End If
+		account = prefix & CStr(i)
+	End While
+End Function
+
+
+
+
+Public Function CCC_AE_CreatedefaultMailAddress_ProxyAddressDump(ByVal PreferredName As String, ByVal LastName As String, ByVal uidperson As String) As String
+	Dim debug As StringBuilder = New StringBuilder
+	
+	Dim i As Int32 = 0
+	PreferredName = CCC_AE_FormatConvertUmlaut_Sonderzeichen_DefaultEmailAddress(PreferredName)
+	LastName = CCC_AE_FormatConvertUmlaut_Sonderzeichen_DefaultEmailAddress(LastName)
+	Dim account As String = Connection.GetConfigParm("Custom\Environment\CentralAccountPrefix") & PreferredName & "." & LastName
+	Dim prefix As String = account
+	Dim maildom As String = String.Empty
+	Dim f As ISqlFormatter = Connection.SqlFormatter
+	'CCC_AE_CreatedefaultMailAddress_Debug = String.Empty
+	
+	' fill existing addresses in a dictionary
+	Dim linkedEntry As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+	Dim unlinkedEntry As New Dictionary(Of String, Object)(StringComparer.OrdinalIgnoreCase)
+
+	Dim dummy As New Object()
+	Dim dummyPerson As ISingleDbObject
+	dummyPerson = Connection.CreateSingle("Person")
+	
+	' 19/11/2022 - BP - Remove Domain from filter to search across all domains
+	' Dim pattern As String = prefix & "%" & maildom
+	Dim pattern As String = prefix & "%"
+	
+	debug.AppendLine("smtp:")
+	Using rd As IDataReader = CType(dummyPerson.Custom.CallMethod("SearchMailAddresses", pattern), IDataReader)
+		While rd.Read()
+			Dim address As String
+			Dim smtpAddress As String
+			Dim objectKeyString As String
+			
+			' 25/10/22 - Brian Pack - Only Compare Prefix
+			'address = rd.GetString(rd.GetOrdinal("smtp"))
+			smtpAddress = rd.GetString(rd.GetOrdinal("smtp")).ToString()
+			address = smtpAddress.Substring(0, smtpAddress.IndexOf("@"c))
+			objectKeyString = rd.GetString(rd.GetOrdinal("ObjectKeyPerson"))
+			If Not String.IsNullOrEmpty(objectKeyString) Then
+				linkedEntry(address) = objectKeyString 
+				debug.AppendLine(address & ", " & objectKeyString)
+			Else
+				unlinkedEntry(address) = dummy
+				debug.AppendLine(address)
+			End If
+		End While
+	End Using
+	
+	Return debug.ToString()
+	
+End Function
+
+Public Function CCC_AE_CreatedefaultMailAddress_NameChangeExist(ByVal email As String, ByVal uid_person As String) As Boolean
+	Dim whereClause As String = "CCC_DefaultEmailAddress like '" & email.Substring(0, email.IndexOf("@"c)) & "%'"
+	If String.IsNullOrEmpty(uid_person) Then
+		whereClause = whereClause & " AND NOT uid_person = '" & uid_person & "'"
+	End If
+	
+	Return Connection.Exists("CCCPersonNameChange", whereClause)
+End Function
