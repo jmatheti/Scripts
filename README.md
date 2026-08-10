@@ -1,4 +1,66 @@
-# OIM 9.2.2 → 9.3.3 Upgrade – VB.NET Script Fixes
+# oim-copilot-assistant
+
+A GitHub Copilot-powered assistant repository for teams managing **Quest One Identity Manager (OIM)** implementations, upgrades, and day-to-day operations.
+
+## Purpose
+
+This repository provides:
+- Custom Copilot instructions and agent configuration for OIM expertise
+- Troubleshooting, upgrade, SQL, and scripting skill guides
+- Issue card and session log templates
+- A shared knowledge base of known issues and SQL snippets
+
+## Repository Structure
+
+```
+oim-copilot-assistant/
+├── .github/
+│   ├── copilot-instructions.md     # Copilot custom instructions
+│   └── agents/
+│       └── oim-expert.agent.md     # OIM Expert agent definition
+├── docs/
+│   ├── skills/                     # Skill guides for common tasks
+│   │   ├── troubleshooting-guide.md
+│   │   ├── upgrade-guide.md
+│   │   ├── sql-query-guide.md
+│   │   └── scripting-guide.md
+│   └── templates/                  # Reusable document templates
+│       ├── issue-card-template.md
+│       └── session-log-template.md
+├── session-logs/                   # Team session logs (use template)
+├── knowledge-base/                 # Shared knowledge repository
+│   ├── known-issues.md
+│   ├── version-matrix.md
+│   └── sql-snippets.md
+├── .gitignore
+└── README.md
+```
+
+## Getting Started
+
+1. **Confirm your OIM version** before every Copilot session (8.x / 9.0 / 9.1 / 9.2 / 9.3+)
+2. **Use the OIM Expert agent** (`@oim-expert`) for version-aware technical assistance
+3. **Log every session** using `/docs/templates/session-log-template.md`
+4. **Raise issues** using `/docs/templates/issue-card-template.md`
+5. **Contribute** resolved issues and SQL snippets back to `/knowledge-base/`
+
+## Safety Rules
+
+- ⚠️ Always flag production-impacting steps before executing
+- Never commit credentials, connection strings, server names, or IP addresses
+- Always have a rollback plan before making DB or schema changes
+- Follow change management approval for all Prod changes
+
+## Reference Sources
+
+1. [support.oneidentity.com](https://support.oneidentity.com) — official KB articles
+2. [community.oneidentity.com](https://community.oneidentity.com) — community solutions
+3. Quest One Identity official documentation portal
+4. `/knowledge-base/` — team knowledge base
+
+---
+
+## Previous Content: OIM 9.2.2 → 9.3.3 Upgrade – VB.NET Script Fixes
 
 This document describes the script fixes applied to resolve compilation errors and logic bugs when upgrading from **One Identity Manager (OIM) 9.2.2** to **9.3.3** on **.NET 8.0**.
 
