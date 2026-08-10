@@ -1,0 +1,20 @@
+# .gitignore for oim-copilot-assistant
+
+# Secrets and environment files
+.env
+*.env
+*.env.*
+secrets.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs (keep session-logs/ directory but ignore generated logs)
+*.log
