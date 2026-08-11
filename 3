@@ -1,0 +1,2910 @@
+#If Not SCRIPTDEBUGGER Then
+	Imports System.Data
+	Imports System.Xml
+#End If
+
+''' <summary>
+''' Reconciliation of Departments with Aurion via Schedule
+''' </summary>
+''' <returns>String result message</returns>
+''' 
+Public Function CCC_Department_Import(Optional ByVal importSource As String = "AUR") As String
+	Dim configBase As String = CCC_Aurion_GetConfigBase(importSource)
+	Dim loggerName As String = CCC_Aurion_GetLoggerPrefix(importSource) & "_DEPTS"
+	CCC_NLog_WriteLog(loggerName, "Debug", "Entering CCC_Department_Import()")
+	'
+	' This script will sync the Org Unit records from Aurion HR to the Department table in OneIM
+	'
+	' vars
+	Dim strRtnValue As String = String.Empty
+	Dim intNewObjs As Integer = 0
+	Dim intUpdatedObjs As Integer = 0
+	Dim intDeletedObjs As Integer = 0
+	Dim strXMLDoc As String = String.Empty
+	Dim xmlDoc As Xml.XmlDocument = New Xml.XmlDocument
+	' Initiate Web Service
+	Dim QUERY_ID As String = Connection.GetConfigParm(configBase & "\QueryFilterFields\QueryIDs\Departments").ToString()
+	Dim P_TOKEN As String = CCC_Aurion_LOGON(importSource)
+	' Perform Supervisor Single-Query to XML Document
+	strXMLDoc = CCC_Aurion_QUERY_TO_XML(loggerName, P_TOKEN, QUERY_ID, String.Empty, importSource)
+	Try
+		xmlDoc.LoadXml(strXMLDoc)
+	Catch ex As Exception
+		Dim strErrorMsg As StringBuilder = New StringBuilder
+		strErrorMsg.AppendLine("Error loading XML.")
+		strErrorMsg.AppendLine(ex.Message())
+		' Disconnect Web Service
+		CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN, importSource)")
+		CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+		' Throw error
+		CCC_NLog_WriteLog(loggerName, "Fatal", strErrorMsg.ToString())
+		Throw New AdHocDataException("Error loading XML. " & strErrorMsg.ToString())
+	End Try
+	' Disconnect Web Service
+	CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN, importSource)")
+	CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+	' Main processing
+	RaiseMessage(MsgSeverity.Info, "AURION - CCC_Department_Import - Starting snychronisation")
+	' SYNC WITH ONEIM OBJECTS
+	' load departments from DB
+	Dim dbDepts As IColDbObject = Connection.CreateCol("Department")
+	dbDepts.Prototype.PutValue("ImportSource", importSource)
+	dbDepts.Prototype("DepartmentName").IsDisplayItem = True
+	dbDepts.Prototype("ObjectID").IsDisplayItem = True
+	dbDepts.Prototype("Description").IsDisplayItem = True
+	dbDepts.Prototype("IsInActive").IsDisplayItem = True
+	dbDepts.Prototype("UID_ParentDepartment").IsDisplayItem = True
+	CCC_NLog_WriteLog(loggerName, "Debug", "Load Department")
+	dbDepts.Load()
+	Dim dbDeptIDs As ArrayList = New ArrayList
+	Dim xmlDeptIDs As ArrayList = New ArrayList
+	For Each dbDept In dbDepts
+		dbDeptIDs.Add(dbDept.GetValue("ObjectID").ToString())
+	Next
+	' compare with org units in xml doc
+	CCC_NLog_WriteLog(loggerName, "Debug", "Loop through XML")
+	For Each node As System.Xml.XmlElement In xmlDoc.DocumentElement
+		Dim strName As String = node.Item("Organisation_Unit_Name").InnerText
+		Dim strNumber As String = node.Item("Organisation_Unit_Number").InnerText
+		Dim strStatus As String = node.Item("Organisation_Unit_Status").InnerText
+		Dim strLevel As String = node.Item("Organisation_Unit_Level").InnerText
+		Dim strParentNumber As String = node.Item("Superior_Org_Unit_Number").InnerText
+		Dim strDescription As String = node.Item("Organisation_Unit_Description").InnerText
+		
+		' 13/06/2023 - BP Add Prefixes to Departments
+		Dim deptPrefix As String = Connection.GetConfigParm(configBase & "\PersonnelNumberPrefix").ToString()
+		strNumber = deptPrefix & strNumber
+		strParentNumber = deptPrefix & strParentNumber
+		
+		xmlDeptIDs.Add(strNumber)
+		If dbDeptIDs.Contains(strNumber) Then
+			Try
+				' dept exists in OneIM. Update attributes if needed
+				dbDepts.Clear()
+				dbDepts.Prototype.WhereClause = "ObjectID = '" & strNumber & "' AND ImportSource = '" & importSource & "'"
+				CCC_NLog_WriteLog(loggerName, "Trace", "Load Department.ObjectGUID = '" & strNumber & "' AND ImportSource = '" & importSource & "'")
+				dbDepts.Load()
+				Dim singleObj As ISingleDbObject = dbDepts(0).Create()
+				For Each nodeItem As System.Xml.XmlElement In node
+					' compare attribute values between XML doc and DB object
+					Select Case LCase(nodeItem.Name)
+						Case "organisation_unit_status"
+							' check DB record for status
+							If (strStatus.ToUpperInvariant() = "ACTIVE") AndAlso (singleObj.GetValue("IsInActive").ToString.ToUpperInvariant() = "TRUE") Then
+								' XML shows active, department is inactive in DB. Set to active
+								CCC_NLog_WriteLog(loggerName, "Debug", "Activating deactive department")
+								singleObj.PutValue("IsInActive", "False")
+								singleObj.PutValue("CustomProperty10", "")
+							End If
+						Case "organisation_unit_name"
+							If (strName <> singleObj.GetValue("DepartmentName").ToString) Then
+								CCC_NLog_WriteLog(loggerName, "Debug", "Updating DepartmentName")
+								singleObj.PutValue("DepartmentName", strName)
+							End If
+						Case "organisation_unit_description"
+							If (strDescription <> singleObj.GetValue("Description").ToString) Then
+								CCC_NLog_WriteLog(loggerName, "Debug", "Updating Description")
+								singleObj.PutValue("Description", strDescription)
+							End If
+						Case "superior_org_unit_number"
+							Dim parentDeptID As String = Connection.GetSingleProperty("Department", "ObjectID", "UID_Department = '" & singleObj.GetValue("UID_ParentDepartment").ToString() & "' AND ImportSource = '" & importSource & "'").ToString()
+							If (strParentNumber.ToUpperInvariant() <> parentDeptID.ToUpperInvariant()) Then
+								' parent department has changed. Load new GUID, set to current dept object
+								Dim newparentDeptGUID As String = Connection.GetSingleProperty("Department", "UID_Department", "ObjectID = '" & strParentNumber & "' AND ImportSource = '" & importSource & "'")
+								If newparentDeptGUID.Length() > 1 Then
+									CCC_NLog_WriteLog(loggerName, "Debug", "Updating parent department")
+									singleObj.PutValue("UID_ParentDepartment", newparentDeptGUID)
+								End If
+							End If
+					End Select
+				Next
+				If singleObj.IsChanged() = True Then
+					' department's attribute values have changed. Save the record to the DB
+					singleObj.Save()
+					intUpdatedObjs = intUpdatedObjs + 1
+				End If
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error updating department attributes.")
+				strErrorMsg.AppendLine("Department ID: " & strNumber)
+				strErrorMsg.AppendLine(ex.Message())
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_Department_Import " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		Else
+			Try
+				' dept not in OneIM. Create it
+				Dim newDbObject As ISingleDbObject = Connection.CreateSingle("Department")
+				newDbObject.PutValue("ImportSource", importSource)
+				'newDbObject.PutValue("CustomProperty01", "AUR") - debugging purposes
+				newDbObject.PutValue("DepartmentName", strName)
+				newDbObject.PutValue("ObjectID", strNumber)
+				newDbObject.PutValue("Description", strDescription)
+				If Not (strStatus.ToUpperInvariant() = "ACTIVE") Then
+					newDbObject.PutValue("IsInActive", "True")
+				End If
+				If strParentNumber.Length() > 0 Then
+					Dim parentGUID As String = Connection.GetSingleProperty("Department", "UID_Department", "ObjectID = '" & strParentNumber & "' AND ImportSource = '" & importSource & "'")
+					If parentGUID.Length() > 1 Then
+						newDbObject.PutValue("UID_ParentDepartment", parentGUID)
+					End If
+				End If
+				CCC_NLog_WriteLog(loggerName, "Debug", "Creating department")
+				newDbObject.Save()
+				intNewObjs = intNewObjs + 1
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error inserting a new department.")
+				strErrorMsg.AppendLine("Department ID: " & strNumber)
+				strErrorMsg.AppendLine(ex.Message())
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_Department_Import " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		End If
+	Next
+	' handle those which only exist in OneIM
+	Dim dbOnlyIDs As ArrayList = New ArrayList
+	For Each dbID In dbDeptIDs
+		If Not (xmlDeptIDs.Contains(dbID)) Then
+			dbOnlyIDs.Add(dbID)
+		End If
+	Next
+	If dbOnlyIDs.Count() > 0 Then
+		' items in DB which do not exist in Aurion XML feed
+		CCC_NLog_WriteLog(loggerName, "Debug", "Loop through missing Aurion Departments")
+		For Each dbObjID As String In dbOnlyIDs
+			Try
+				dbDepts.Clear()
+				dbDepts.Prototype.WhereClause = "ObjectID = '" & dbObjID & "' AND ImportSource = '" & importSource & "'"
+				dbDepts.Load()
+				Dim singleObj As ISingleDbObject = dbDepts(0).Create()
+				If singleObj.GetValue("IsInActive").ToString.ToUpperInvariant() = "FALSE" Then
+					singleObj.PutValue("IsInActive", "True")
+					singleObj.PutValue("CustomProperty10", "DOES_NOT_EXIST")
+					singleObj.Save()
+					intDeletedObjs = intDeletedObjs + 1
+				End If
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error deactivating a department.")
+				strErrorMsg.AppendLine("Department ID: " & dbObjID)
+				strErrorMsg.AppendLine(ex.Message())
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_Department_Import " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		Next
+	End If
+	' return some stats
+	Dim strWrite As StringBuilder = New StringBuilder
+	strWrite.AppendLine("AURION HR - Department Import Script")
+	strWrite.AppendLine("Total departments created: " & intNewObjs)
+	strWrite.AppendLine("Total departments updated: " & intUpdatedObjs)
+	strWrite.AppendLine("Total departments deactivated: " & intDeletedObjs)
+	strRtnValue = strWrite.ToString()
+	RaiseMessage(MsgSeverity.Info, "AURION - CCC_Department_Import " & vbCrLf & strWrite.ToString())
+	CCC_NLog_WriteLog(loggerName, "Debug", "Exiting CCC_Department_Import()")
+	Return strRtnValue
+End Function
+
+''' <summary>
+''' Reconciliation of Users with Aurion via Schedule
+''' </summary>
+''' <returns>String result message</returns>
+''' 
+Public Function CCC_ESS_Users_Sync(Optional ByVal importSource As String = "AUR") As String
+	Dim configBase As String = CCC_Aurion_GetConfigBase(importSource)
+	Dim loggerName As String = CCC_Aurion_GetLoggerPrefix(importSource) & "_USERS"
+	Dim strUNSRootName As String = Connection.GetConfigParm(configBase & "\ESS\ESSRoot").ToString()
+	
+	Dim insertFunction As String = "CCC_UNSAccountB_" & strUNSRootName & "_Insert"
+	Dim updateFunction As String = "CCC_UNSAccountB_" & strUNSRootName & "_Update"
+	
+	CCC_NLog_WriteLog(loggerName, "Debug", "Entering CCC_ESS_Users_Sync()")
+	'
+	' This script will sync the ESS Users from Aurion HR to the UNSAccountB table in OneIM
+	'
+	RaiseMessage(MsgSeverity.Info, "AURION - CCC_ESS_Users_Sync - Start")
+	' vars
+	Dim strRtnValue As String = String.Empty
+	Dim intUpdatedObjs As Integer = 0
+	Dim intCreatedObjs As Integer = 0
+	Dim strXMLDoc As String = String.Empty
+	Dim xmlDoc As Xml.XmlDocument = New Xml.XmlDocument
+	Dim filterPattern As String = Connection.GetConfigParm(configBase & "\QueryFilterFields\PersonnelNumber") & "={0}|" & Connection.GetConfigParm(configBase & "\QueryFilterFields\PersonnelNumber") & "={1}"
+	Dim blockSize As Int32 = 2000
+	Int32.TryParse(Connection.GetConfigParm(configBase & "\QueryFilterFields\BlockSize"), blockSize)
+	Dim lastMax As Int32 = 0
+	Dim trimChar As Char() = New Char(){"0"c}
+	
+		' Brian Pack - 10/03/2022
+	' MSSQL sort behaves unexpectedly for Strings with speical characters (e.g. '-') and so we are managing this ourselves
+	CCC_NLog_WriteLog(loggerName, "Debug", "Build Sorted List of personnel numbers (personnelNumber)")
+	Dim dbPersonEnum As List(Of String) = New List(Of String)
+	Dim dbPersonCol As IColDbObject = Connection.CreateCol("Person")
+	dbPersonCol.Prototype("UID_Person").IsDisplayItem = True
+	dbPersonCol.Prototype("PersonnelNumber").IsDisplayItem = True
+	dbPersonCol.Prototype.WhereClause = "isnull(PersonnelNumber, '') <> '' AND ImportSource = '" & importSource & "'"
+	dbPersonCol.Load()
+	
+	Dim trimPrefix As Char() = New Char() {}
+	trimPrefix = Connection.GetConfigParm(configBase & "\PersonnelNumberPrefix").ToString().ToCharArray()
+	
+	For Each dbPerson In dbPersonCol
+		dbPersonEnum.Add(dbPerson.GetEntity.GetValue("PersonnelNumber").ToString().TrimStart(trimPrefix))
+	Next
+	dbPersonEnum.Add("0")
+	' Add Largest Possible Personnel Number to capture new employees 
+	dbPersonEnum.Add(Connection.GetConfigParm(configBase & "\QueryFilterFields\PersonnelNumber\Maximum").ToString())
+	dbPersonEnum.Sort(StringComparer.Ordinal)
+	
+	Dim filter As String = String.Empty
+	' Initiate Web Service
+	Dim QUERY_ID As String = Connection.GetConfigParm(configBase & "\QueryFilterFields\QueryIDs\SecurityProfiles").ToString()
+	Dim P_TOKEN As String = CCC_Aurion_LOGON(importSource)
+	' Build Query blocks for IAM_EMPLOYMENT report XML from Aurion
+	Dim minVal As String = ""
+	Dim maxVal As String = "0"
+	
+	' 10/03/2022 - Brian Pack
+	' Calaculate Filter Queries
+	Dim index As Int32 = 0
+	While (True)
+		If index < dbPersonEnum.count Then
+			minVal = maxVal
+			
+			If (index + blockSize > dbPersonEnum.count) Then
+				index = dbPersonEnum.count
+			Else
+				index = index + blockSize
+			End If
+			maxVal = dbPersonEnum(index - 1)
+			filter = String.Format("{2}#" & filterPattern, minVal, maxVal, filter)		
+			Continue While
+		Else
+			Exit While
+		End If	
+	End While	
+	
+	
+'	Dim filter As String = String.Empty
+	' Initiate Web Service
+'	Dim QUERY_ID As String = Connection.GetConfigParm(configBase & "\QueryFilterFields\QueryIDs\SecurityProfiles").ToString()
+'	Dim P_TOKEN As String = CCC_Aurion_LOGON(importSource)
+	' Build Query blocks for IAM_ESSUSER report XML from Aurion
+'	Dim minVal As String = Connection.GetConfigParm(configBase & "\QueryFilterFields\PersonnelNumber\Minimum").ToString()
+'	Dim maxVal As String = Connection.GetSingleProperty("Person", "PersonnelNumber", "isnull(PersonnelNumber, '') = (SELECT MAX(PersonnelNumber) FROM Person WHERE isnull(PersonnelNumber, '') IN (SELECT TOP " & blockSize.ToString() & " PersonnelNumber FROM Person WHERE isnull(PersonnelNumber, '') <> '' AND ImportSource = '" & importSource & "' ORDER BY PersonnelNumber))")
+'	filter = String.Format(filterPattern, minVal, maxVal)
+'	Int32.TryParse(maxVal, lastMax)
+'	While (Not String.IsNullOrEmpty(minVal) AndAlso Not String.IsNullOrEmpty(maxVal))
+'		If lastMax > 0 Then
+'			minVal = (lastMax + 1).ToString().TrimEnd(trimChar)
+'			maxVal = Connection.GetSingleProperty("Person", "PersonnelNumber", "isnull(PersonnelNumber, '') = (SELECT MAX(PersonnelNumber) FROM Person WHERE isnull(PersonnelNumber, '') IN (SELECT TOP " & blockSize.ToString() & " PersonnelNumber FROM Person WHERE isnull(PersonnelNumber, '') <> '' AND isnull(PersonnelNumber, '') >= '" & (lastMax + 1).ToString().TrimEnd(trimChar) & "' AND ImportSource = '" & importSource & "' ORDER BY PersonnelNumber))")
+'		Else
+'			minVal = Connection.GetSingleProperty("Person", "PersonnelNumber", "isnull(PersonnelNumber, '') = (SELECT MIN(PersonnelNumber) FROM Person WHERE isnull(PersonnelNumber, '') IN (SELECT TOP " & blockSize.ToString() & " PersonnelNumber FROM Person WHERE isnull(PersonnelNumber, '') <> '' AND isnull(PersonnelNumber, '') > '" & maxVal.ToString() & "' AND ImportSource = '" & importSource & "' ORDER BY PersonnelNumber))")
+'			maxVal = Connection.GetSingleProperty("Person", "PersonnelNumber", "isnull(PersonnelNumber, '') = (SELECT MAX(PersonnelNumber) FROM Person WHERE isnull(PersonnelNumber, '') IN (SELECT TOP " & blockSize.ToString() & " PersonnelNumber FROM Person WHERE isnull(PersonnelNumber, '') <> '' AND isnull(PersonnelNumber, '') > '" & maxVal.ToString() & "' AND ImportSource = '" & importSource & "' ORDER BY PersonnelNumber))")
+'		End If
+'		If Not String.IsNullOrEmpty(minVal) AndAlso Not String.IsNullOrEmpty(maxVal) Then
+'			filter = String.Format("{2}#" & filterPattern, minVal, maxVal, filter)
+'			lastMax = 0
+'			Int32.TryParse(maxVal, lastMax)
+'			Continue While
+'		Else
+'			Exit While
+'		End If
+'	End While
+'	If lastMax > 0 Then
+'		filter = String.Format("{2}#" & filterPattern, (lastMax + 1).ToString().TrimEnd(trimChar), Connection.GetConfigParm(configBase & "\QueryFilterFields\PersonnelNumber\Maximum").ToString(), filter)
+	'End If
+	
+	
+	
+	
+	
+	
+	' Perform Multi-Query to single XML Document
+	strXMLDoc = CCC_Aurion_QUERY_TO_XML(loggerName, P_TOKEN, QUERY_ID, filter, importSource)
+	Try
+		xmlDoc.LoadXml(strXMLDoc)
+	Catch ex As Exception
+		Dim strErrorMsg As StringBuilder = New StringBuilder
+		strErrorMsg.AppendLine("Error loading XML.")
+		strErrorMsg.AppendLine(ex.Message())
+		' Disconnect Web Service
+		CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN, importSource)")
+		CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+		' Throw error
+		CCC_NLog_WriteLog(loggerName, "Fatal", strErrorMsg.ToString())
+		Throw New AdHocDataException("Error loading XML. " & strErrorMsg.ToString())
+	End Try
+	' Disconnect Web Service
+	'CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN, importSource)")
+	'CCC_Aurion_LOGOFF(P_TOKEN, importSource) ' 22/9/2025 - GG - reuse token for updates
+	' Main processing
+	RaiseMessage(MsgSeverity.Info, "AURION - CCC_ESS_Users_Sync - Starting snychronisation")
+	' SYNC WITH ONEIM OBJECTS
+	' load accounts from DB
+	
+	Dim strUNSRoot As String = Connection.GetSingleProperty("UNSRoot", "UID_UNSRoot", String.Format("CanonicalName = '{0}'", strUNSRootName))
+	Dim dbAccts As IColDbObject = Connection.CreateCol("UNSAccountB")
+	dbAccts.Prototype.PutValue("UID_UNSRootB", strUNSRoot)
+	dbAccts.Prototype.WhereClause = "ObjectGUID IS NOT NULL"
+	dbAccts.Prototype("ObjectGUID").IsDisplayItem = True
+	CCC_NLog_WriteLog(loggerName, "Debug", String.Format("Load UNSAccountB.CanonicalName LIKE '{0}/%'", strUNSRootName))
+	dbAccts.Load()
+	Dim dbAcctIDs As ArrayList = New ArrayList
+	Dim xmlAcctIDs As ArrayList = New ArrayList
+	For Each dbAcct In dbAccts
+		dbAcctIDs.Add(dbAcct.GetValue("ObjectGUID").ToString())
+	Next
+	' compare with accounts in xml doc
+	CCC_NLog_WriteLog(loggerName, "Debug", "Loop through XML")
+	For Each node As System.Xml.XmlElement In xmlDoc.DocumentElement
+		Dim strUserId As String = node.Item("User_Id").InnerText
+		' TODO roll back to OS_User_Id
+		Dim strOSUserID As String = node.Item("OS_User_Id").InnerText
+		Dim strUserName As String = node.Item("User_Name").InnerText
+		Dim strPersonNo As String = node.Item("Person_Number").InnerText
+		Dim strUserStatus As String = node.Item("User_Status").InnerText
+		Dim strEmailAddr As String = node.Item("Email_Address").InnerText
+		xmlAcctIDs.Add(strUserId)		
+		If dbAcctIDs.Contains(strUserId) Then
+			Try
+				' account exists in OneIM. Update attributes if needed
+				dbAccts.Clear()
+				dbAccts.Prototype.WhereClause = String.Format("ObjectGUID = '{0}' AND UID_UNSRootB = '{1}'", strUserId.Replace("'", "''"), strUNSRoot)
+				CCC_NLog_WriteLog(loggerName, "Trace", "Load UNSAccountB.ObjectGUID = '" & strUserId.Replace("'", "''") & "'")
+				dbAccts.Load()
+				Dim singleObj As ISingleDbObject = dbAccts(0).Create()
+				' Checks if the ESS account is assigned to a Person in OneIM
+				If singleObj.GetValue("UID_Person").ToString <> "" Then
+					CCC_NLog_WriteLog(loggerName, "Debug", "Has UID_Person")
+					Dim accountChanged As Boolean = False
+					Dim queryString As String = strUserId
+					If queryString.Contains("'") Then
+						queryString = queryString.Replace("'", "''")
+					End If
+					Dim qObjects As Query = Query.From("UNSAccountB").Where(String.Format("ObjectGUID = '{0}' AND UID_UNSRootB = '{1}'", queryString, strUNSRoot)).SelectAll()
+					Dim colObjects As IEntityCollection = Session.Source().GetCollection(qObjects, EntityCollectionLoadType.Bulk)
+					Dim db As IEntity = colObjects(0).Create(Session, EntityLoadType.DelayedLogic)
+					Dim dbObj As ISingleDbObject = Connection.CreateSingle("UNSAccountB", db.GetValue("UID_UNSAccountB").ToString())
+					Dim objSnapShot As SingleDbObjectSnapshot = New SingleDbObjectSnapshot(dbObj)
+					' compare the attribute values. If the account has changed, then generate an update event to update ESS
+					' account status
+					If (db.GetValue("AccountDisabled").Bool = True And strUserStatus = "PERMITTED") Or (db.GetValue("AccountDisabled").Bool = False And strUserStatus = "INHIBITED") Then
+						CCC_NLog_WriteLog(loggerName, "Debug", "Flagged by AccountDisabled difference")
+						accountChanged = True
+					End If
+					' email address
+					If Not (strEmailAddr = Nothing Or strEmailAddr.Length() < 1) Then
+						If db.GetValue("CCC_EmailAddress").ToString <> strEmailAddr Then
+							CCC_NLog_WriteLog(loggerName, "Debug", "Flagged by CCC_EmailAddress difference")
+							accountChanged = True
+						End If
+					Else
+						' user has no email in ESS, so let's set one if we have it
+						If db.GetValue("CCC_EmailAddress").ToString.Length() > 1 Then
+							CCC_NLog_WriteLog(loggerName, "Debug", "Flagged by CCC_EmailAddress missing")
+							accountChanged = True
+						End If
+					End If
+					' OS user ID - AD user name/SAMAccountName
+					If Not (strOSUserID = Nothing Or strOSUserID.Length() < 1) Then
+						If Not db.GetValue("AccountName").ToString.Equals(strOSUserID, StringComparison.CurrentCultureIgnoreCase) Then
+							CCC_NLog_WriteLog(loggerName, "Debug", "Flagged by AccountName difference")
+							accountChanged = True
+						End If
+					Else
+						' no OS user id.
+						If db.GetValue("AccountName").ToString.Length() > 1 Then
+							CCC_NLog_WriteLog(loggerName, "Debug", "Flagged by AccountName missing")
+							accountChanged = True
+						End If
+					End If
+					' USER_NAME - DisplayName
+					If Not (strUserName = Nothing Or strUserName.Length() < 1) Then
+						If db.GetValue("DisplayName").ToString <> strUserName Then
+							CCC_NLog_WriteLog(loggerName, "Debug", "Flagged by DisplayName difference")
+							accountChanged = True
+						End If
+					Else
+						' no display name.
+						If db.GetValue("DisplayName").ToString.Length() > 1 Then
+							CCC_NLog_WriteLog(loggerName, "Debug", "Flagged by DisplayName missing")
+							accountChanged = True
+						End If
+					End If
+					If accountChanged = True Then
+						CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_UNSAccountB_ESS_Update()")
+						'CCC_UNSAccountB_ESS_Update(objSnapShot)
+						' 07/06/2023 - BP - Dynamically Call Insert Method
+						Dim params As Object() = {objSnapShot, P_TOKEN}
+						CallByName(Me, updateFunction, vbMethod, params) 
+						intUpdatedObjs = intUpdatedObjs + 1
+					End If
+				End If
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error updating account attributes.")
+				strErrorMsg.AppendLine("Personnel number: " & strPersonNo)
+				strErrorMsg.AppendLine(ex.Message())
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_ESS_Users_Sync " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		End If
+	Next
+	' handle those which only exist in OneIM
+	Dim dbOnlyIDs As ArrayList = New ArrayList
+	For Each dbID In dbAcctIDs
+		If Not (xmlAcctIDs.Contains(dbID)) Then
+			dbOnlyIDs.Add(dbID)
+		End If
+	Next
+	If dbOnlyIDs.Count() > 0 Then
+		' items in DB which do not exist in Aurion XML feed
+		' should create the ESS user account
+		CCC_NLog_WriteLog(loggerName, "Debug", "Loop through missing Aurion Users")
+		For Each dbObjID As String In dbOnlyIDs
+			Try
+				Dim queryString As String = dbObjID
+				If queryString.Contains("'") Then
+					queryString = queryString.Replace("'", "''")
+				End If		
+				Dim qObjects As Query = Query.From("UNSAccountB").Where(String.Format("ObjectGUID = '{0}' AND UID_UNSRootB = '{1}'", queryString, strUNSRoot)).SelectAll()
+				Dim colObjects As IEntityCollection = Session.Source().GetCollection(qObjects, EntityCollectionLoadType.Bulk)
+				Dim db As IEntity = colObjects(0).Create(Session, EntityLoadType.DelayedLogic)
+				Dim dbObj As ISingleDbObject = Connection.CreateSingle("UNSAccountB", db.GetValue("UID_UNSAccountB").ToString())
+				Dim objSnapShot As SingleDbObjectSnapshot = New SingleDbObjectSnapshot(dbObj)
+				CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_UNSAccountB_ESS_Insert()")
+				'CCC_UNSAccountB_ESS_Insert(objSnapShot, strXMLDoc)
+				' 07/06/2023 - BP - Dynamically Call Insert Method
+				Dim params As Object() = {objSnapShot, strXMLDoc, P_TOKEN}
+				CallByName(Me, insertFunction, vbMethod, params) 
+				
+				'insertFunction()
+				
+				intCreatedObjs = intCreatedObjs + 1
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error creating a missing ESS user")
+				strErrorMsg.AppendLine("Object GUID: " & dbObjID)
+				strErrorMsg.AppendLine(ex.Message())
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_ESS_Users_Sync " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		Next
+	End If
+	
+	CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN, importSource)")
+	CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+	
+	' return some stats
+	Dim strWrite As StringBuilder = New StringBuilder
+	strWrite.AppendLine("AURION HR - ESS User Import Script")
+	strWrite.AppendLine("Total ESS user accounts updated in Aurion: " & intUpdatedObjs)
+	strWrite.AppendLine("Total ESS user accounts created: " & intCreatedObjs)
+	strRtnValue = strWrite.ToString()
+	RaiseMessage(MsgSeverity.Info, "AURION - CCC_ESS_Users_Sync " & vbCrLf & strWrite.ToString())
+	CCC_NLog_WriteLog(loggerName, "Debug", "Exiting CCC_ESS_Users_Sync()")
+	Return strRtnValue
+End Function
+
+''' <summary>
+''' Import of Locations from Aurion via Schedule
+''' </summary>
+''' <returns>String result message</returns>
+''' 
+Public Function CCC_Locality_Import(Optional ByVal importSource As String = "AUR") As String
+	Dim configBase As String = CCC_Aurion_GetConfigBase(importSource)
+	Dim loggerName As String = CCC_Aurion_GetLoggerPrefix(importSource) & "_LOCATITY"
+	CCC_NLog_WriteLog(loggerName, "Debug", "Entering CCC_Locality_Import()")
+	'
+	' This script will sync the Location records from Aurion HR to the Locality table in OneIM
+	'
+	' vars
+	Dim f As ISqlFormatter = Connection.SqlFormatter
+	Dim strRtnValue As String = String.Empty
+	Dim intNewObjs As Integer = 0
+	Dim intUpdatedObjs As Integer = 0
+	Dim intDeletedObjs As Integer = 0
+	Dim strXMLDoc As String = String.Empty
+	Dim xmlDoc As Xml.XmlDocument = New Xml.XmlDocument
+	' Initiate Web Service
+	Dim QUERY_ID As String = Connection.GetConfigParm(configBase & "\QueryFilterFields\QueryIDs\Locations").ToString()
+	Dim P_TOKEN As String = CCC_Aurion_LOGON(importSource)
+	' Perform Supervisor Single-Query to XML Document
+	strXMLDoc = CCC_Aurion_QUERY_TO_XML(loggerName, P_TOKEN, QUERY_ID, String.Empty, importSource)
+	Try
+		xmlDoc.LoadXml(strXMLDoc)
+	Catch ex As Exception
+		Dim strErrorMsg As StringBuilder = New StringBuilder
+		strErrorMsg.AppendLine("Error loading XML.")
+		strErrorMsg.AppendLine(ex.Message())
+		' Disconnect Web Service
+		CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN, importSource)")
+		CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+		' Throw error
+		CCC_NLog_WriteLog(loggerName, "Fatal", strErrorMsg.ToString())
+		Throw New AdHocDataException("Error loading XML. " & strErrorMsg.ToString())
+	End Try
+	' Disconnect Web Service
+	CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN, importSource)")
+	CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+	' Main processing
+	RaiseMessage(MsgSeverity.Info, "AURION - CCC_Locality_Import - Starting snychronisation")
+	' SYNC WITH ONEIM OBJECTS
+	' load departments from DB
+	Dim dbLocs As IColDbObject = Connection.CreateCol("Locality")
+	dbLocs.Prototype.PutValue("ImportSource", importSource)
+	dbLocs.Prototype("Ident_Locality").IsDisplayItem = True
+	dbLocs.Prototype("ShortName").IsDisplayItem = True
+	dbLocs.Prototype("LongName").IsDisplayItem = True
+	dbLocs.Prototype("IsInActive").IsDisplayItem = True
+	CCC_NLog_WriteLog(loggerName, "Debug", "Load Locality")
+	dbLocs.Load()
+	Dim dbLocIDs As ArrayList = New ArrayList
+	Dim xmlLocIDs As ArrayList = New ArrayList
+	For Each dbLoc In dbLocs
+		dbLocIDs.Add(dbLoc.GetValue("Ident_Locality").ToString())
+	Next
+	' compare with locations in xml doc
+	CCC_NLog_WriteLog(loggerName, "Debug", "Loop through XML")
+	For Each node As System.Xml.XmlElement In xmlDoc.DocumentElement
+		Dim strCode As String = node.Item("Code").InnerText
+		Dim strStatus As String = node.Item("Record_Status").InnerText
+		Dim strShortDesc As String = node.Item("Short_Description").InnerText
+		Dim strLongDesc As String = node.Item("Long_Description").InnerText
+		Dim strPostCode As String = node.Item("Code_Group").InnerText
+		Dim strStreet As String = node.Item("Street_Address").InnerText
+		Dim strSuburb As String = node.Item("Suburb").InnerText
+		'Dim strPostCode As String = node.Item("Post_Code").InnerText ' - post code stored in Code_Group attribute,
+		Dim strCountry_Code As String = node.Item("Country_Code").InnerText
+		' Conver Country value to UID
+		Dim uidCountry As String = String.Empty
+		If Not String.IsNullOrEmpty(strCountry_Code) Then
+			uidCountry = Connection.GetSingleProperty("DialogCountry", "UID_DialogCountry", f.OrRelation(f.Comparison("CountryName", strCountry_Code, ValType.String, CompareOperator.Equal, FormatterOptions.IgnoreCase),f.Comparison("Iso3166_2", strCountry_Code, ValType.String, CompareOperator.Equal, FormatterOptions.IgnoreCase),f.Comparison("Iso3166_3", strCountry_Code, ValType.String, CompareOperator.Equal, FormatterOptions.IgnoreCase))).String
+		End If
+		Dim strState As String = node.Item("State").InnerText
+		' Conver State value to UID
+		Dim uidState As String = String.Empty
+		If Not String.IsNullOrEmpty(strState) AndAlso Not String.IsNullOrEmpty(uidCountry) Then
+			uidState = Connection.GetSingleProperty("DialogState", "UID_DialogState", f.AndRelation(f.UidComparison("UID_DialogCountry", uidCountry, CompareOperator.Equal), f.OrRelation(f.Comparison("Ident_DialogState", strState, ValType.String, CompareOperator.Equal, FormatterOptions.IgnoreCase),f.Comparison("ShortName", strState, ValType.String, CompareOperator.Equal, FormatterOptions.IgnoreCase)))).String
+		End If
+		
+		' 13/06/2023 - BP Add Prefixes to Departments
+		Dim locPrefix As String = Connection.GetConfigParm(configBase & "\PersonnelNumberPrefix").ToString()
+		strCode = locPrefix & strCode
+		
+		xmlLocIDs.Add(strCode)
+		If dbLocIDs.Contains(strCode) Then
+			Try
+				' location exists in OneIM. Update attributes if needed
+				dbLocs.Clear()
+				dbLocs.Prototype.WhereClause = "Ident_Locality = '" & strCode & "' AND ImportSource = '" & importSource & "'"
+				CCC_NLog_WriteLog(loggerName, "Debug", "Load existing Locality.Ident_Locality = '" & strCode & "' AND ImportSource = '" & importSource & "'")
+				dbLocs.Load()
+				Dim singleObj As ISingleDbObject = dbLocs(0).Create()
+				For Each nodeItem As System.Xml.XmlElement In node
+					' compare attribute values between XML doc and DB object
+					Select Case LCase(nodeItem.Name)
+						Case "record_status"
+							' check DB record for status
+							If (strStatus.ToUpperInvariant() = "ACTIVE") AndAlso (singleObj.GetValue("IsInActive").ToString.ToUpperInvariant() = "TRUE") Then
+								' XML shows active, location is inactive in DB. Set to active
+								singleObj.PutValue("IsInActive", "False")
+								singleObj.PutValue("CustomProperty10", "")
+							ElseIf (strStatus.ToUpperInvariant() = "INACTIVE") AndAlso (singleObj.GetValue("IsInActive").ToString.ToUpperInvariant() = "FALSE") Then
+								' XML shows inactive, location is active in DB. Set to inactive
+								singleObj.PutValue("IsInActive", "True")
+							End If
+						Case "short_description"
+							If (strShortDesc <> singleObj.GetValue("ShortName").ToString) Then
+								singleObj.PutValue("ShortName", strShortDesc)
+							End If
+						Case "long_description"
+							If (strLongDesc <> singleObj.GetValue("LongName").ToString) Then
+								singleObj.PutValue("LongName", strLongDesc)
+							End If
+						Case "code_group"
+							If (strPostCode.ToUpperInvariant() <> singleObj.GetValue("ZIPCode").ToString.ToUpperInvariant()) Then
+								singleObj.PutValue("ZIPCode", strPostCode)
+							End If
+						Case "street_address"
+							If (strStreet <> singleObj.GetValue("Street").ToString) Then
+								singleObj.PutValue("Street", strStreet)
+							End If
+						Case "suburb"
+							If (strSuburb <> singleObj.GetValue("City").ToString) Then
+								singleObj.PutValue("Suburb", strSuburb)
+							End If
+						Case "country_code"
+							If (uidCountry <> singleObj.GetValue("UID_DialogCountry").ToString) Then
+								singleObj.PutValue("UID_DialogCountry", uidCountry)
+							End If
+						Case "state"
+							If (uidState <> singleObj.GetValue("UID_DialogState").ToString) Then
+								singleObj.PutValue("UID_DialogState", uidState)
+							End If
+					End Select
+				Next
+				If singleObj.IsChanged() = True Then
+					' locations's attribute values have changed. Save the record to the DB
+					CCC_NLog_WriteLog(loggerName, "Debug", "Updating Locality")
+					singleObj.Save()
+					intUpdatedObjs = intUpdatedObjs + 1
+				End If
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error updating location attributes.")
+				strErrorMsg.AppendLine("Location ID: " & strCode)
+				strErrorMsg.AppendLine(ex.Message())
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_Locality_Import " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		Else
+			Try
+				' loc not in OneIM. Create it
+				CCC_NLog_WriteLog(loggerName, "Debug", "New Locality")
+				Dim newDbObject As ISingleDbObject = Connection.CreateSingle("Locality")
+				newDbObject.PutValue("ImportSource", importSource)
+				'newDbObject.PutValue("CustomProperty01", "AUR") '- debugging purposes
+				newDbObject.PutValue("Ident_Locality", strCode)
+				newDbObject.PutValue("ShortName", strShortDesc)
+				newDbObject.PutValue("LongName", strLongDesc)
+				If Not (strStatus.ToUpperInvariant() = "ACTIVE") Then
+					newDbObject.PutValue("IsInActive", "True")
+				End If
+				newDbObject.PutValue("ZIPCode", strPostCode)
+				newDbObject.PutValue("Street", strStreet)
+				newDbObject.PutValue("City", strSuburb)
+				newDbObject.PutValue("UID_DialogState", uidState) ' - left this in here for future use
+				newDbObject.PutValue("UID_DialogCountry", uidCountry) ' - left this in here for future use
+				CCC_NLog_WriteLog(loggerName, "Debug", "Creating Locality")
+				newDbObject.Save()
+				intNewObjs = intNewObjs + 1
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error inserting a new location.")
+				strErrorMsg.AppendLine("Location ID: " & strCode)
+				strErrorMsg.AppendLine(ex.Message())
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_Locality_Import " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		End If
+	Next
+	' handle those which only exist in OneIM
+	Dim dbOnlyIDs As ArrayList = New ArrayList
+	For Each dbID In dbLocIDs
+		If Not (xmlLocIDs.Contains(dbID)) Then
+			dbOnlyIDs.Add(dbID)
+		End If
+	Next
+	If dbOnlyIDs.Count() > 0 Then
+		' items in DB which do not exist in Aurion XML feed
+		CCC_NLog_WriteLog(loggerName, "Debug", "Loop through missing Aurion Localities")
+		For Each dbObjID As String In dbOnlyIDs
+			Try
+				dbLocs.Clear()
+				dbLocs.Prototype.WhereClause = "Ident_Locality = '" & dbObjID & "' AND ImportSource = '" & importSource & "'"
+				dbLocs.Load()
+				Dim singleObj As ISingleDbObject = dbLocs(0).Create()
+				If singleObj.GetValue("IsInActive").ToString.ToUpperInvariant() = "FALSE" Then
+					singleObj.PutValue("IsInActive", "True")
+					singleObj.PutValue("CustomProperty10", "DOES_NOT_EXIST")
+					CCC_NLog_WriteLog(loggerName, "Debug", "Deactivating Locality")
+					singleObj.Save()
+					intDeletedObjs = intDeletedObjs + 1
+				End If
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error deactivating a location")
+				strErrorMsg.AppendLine("Location ID: " & dbObjID)
+				strErrorMsg.AppendLine(ex.Message())
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_Locality_Import " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		Next
+	End If
+	' return some stats
+	Dim strWrite As StringBuilder = New StringBuilder
+	strWrite.AppendLine("AURION HR - Locality Import Script")
+	strWrite.AppendLine("Total locations created: " & intNewObjs)
+	strWrite.AppendLine("Total locations updated: " & intUpdatedObjs)
+	strWrite.AppendLine("Total locations deactivated: " & intDeletedObjs)
+	strRtnValue = strWrite.ToString()
+	RaiseMessage(MsgSeverity.Info, "AURION - CCC_Locality_Import " & vbCrLf & strWrite.ToString())
+	CCC_NLog_WriteLog(loggerName, "Debug", "Exiting CCC_Locality_Import()")
+	Return strRtnValue
+End Function
+
+''' <summary>
+''' Import of Users from Aurion via Schedule
+''' </summary>
+''' <returns>String result message</returns>
+''' 
+Public Function CCC_Person_Import_Employment(Optional ByVal importSource As String = "AUR") As String
+	Dim configBase As String = CCC_Aurion_GetConfigBase(importSource)
+	Dim loggerName As String = CCC_Aurion_GetLoggerPrefix(importSource) & "_EMPLOYMENT"
+	CCC_NLog_WriteLog(loggerName, "Debug", "Entering CCC_Person_Import_Employment()")
+	
+	' Brian Pack - 10/03/2022
+	' MSSQL sort behaves unexpectedly for Strings with speical characters (e.g. '-') and so we are managing this ourselves
+	CCC_NLog_WriteLog(loggerName, "Debug", "Build Sorted List of employee numbers (CCC_EmployeeNumber)")
+	Dim dbPersonEnum As List(Of String) = New List(Of String)
+	Dim dbPersonCol As IColDbObject = Connection.CreateCol("Person")
+	dbPersonCol.Prototype("UID_Person").IsDisplayItem = True
+	dbPersonCol.Prototype("CCC_EmployeeNumber").IsDisplayItem = True
+	dbPersonCol.Prototype.WhereClause = "isnull(CCC_EmployeeNumber, '') <> '' AND ImportSource = '" & importSource & "'"
+	dbPersonCol.Load()
+	
+	Dim trimPrefix As Char() = New Char() {}
+	trimPrefix = Connection.GetConfigParm(configBase & "\PersonnelNumberPrefix").ToString().ToCharArray()
+	
+	For Each dbPerson In dbPersonCol
+		dbPersonEnum.Add(dbPerson.GetEntity.GetValue("CCC_EmployeeNumber").ToString().TrimStart(trimPrefix))
+	Next
+	dbPersonEnum.Add("0")
+
+	' Add Largest Possible Employee Number to capture new employees 
+	dbPersonEnum.Add(Connection.GetConfigParm(configBase & "\QueryFilterFields\EmployeeNumber\Maximum").ToString())
+	
+	dbPersonEnum.Sort(StringComparer.Ordinal)
+'	Dim eNumString As String = ""
+'	For Each entry As String In dbPersonEnum
+'		eNumString =  eNumString & entry & Environment.NewLine
+'	Next
+	
+	'
+	' This script will sync the Employment records from Aurion HR to the Person table in OneIM
+	'
+	' vars
+	Dim intNewObjs As Integer = 0
+	Dim intUpdatedObjs As Integer = 0
+	Dim intDeletedObjs As Integer = 0
+	Dim strXMLDocEmp As String = String.Empty
+	Dim strXMLDocSup As String = String.Empty
+	Dim xmlDocEmp As Xml.XmlDocument = New Xml.XmlDocument
+	Dim xmlDocSup As Xml.XmlDocument = New Xml.XmlDocument
+	Dim filterPattern As String = Connection.GetConfigParm(configBase & "\QueryFilterFields\EmployeeNumber") & "={0}|" & Connection.GetConfigParm(configBase & "\QueryFilterFields\EmployeeNumber") & "={1}"
+	Dim blockSize As Int32 = 2000
+	Int32.TryParse(Connection.GetConfigParm(configBase & "\QueryFilterFields\BlockSize"), blockSize)
+
+	Dim filter As String = String.Empty
+	' Initiate Web Service
+	Dim QUERY_ID As String = String.Empty
+	Dim P_TOKEN As String = CCC_Aurion_LOGON(importSource)
+	' Build Query blocks for IAM_EMPLOYMENT report XML from Aurion
+	Dim minVal As String = ""
+	Dim maxVal As String = "0"
+	
+	' 10/03/2022 - Brian Pack
+	' Calaculate Filter Queries
+	Dim index As Int32 = 0
+	While (True)
+		If index < dbPersonEnum.count Then
+			minVal = maxVal
+			
+			If (index + blockSize > dbPersonEnum.count) Then
+				index = dbPersonEnum.count
+			Else
+				index = index + blockSize
+			End If
+			maxVal = dbPersonEnum(index - 1)
+			filter = String.Format("{2}#" & filterPattern, minVal, maxVal, filter)		
+			Continue While
+		Else
+			Exit While
+		End If	
+	End While
+	
+	CCC_NLog_WriteLog(loggerName, "Debug", "Filter Calculation:" & filter)
+
+	' Perform Employment Multi-Query to single XML Document
+	QUERY_ID = Connection.GetConfigParm(configBase & "\QueryFilterFields\QueryIDs\Employments").ToString()
+	Dim empSplitQueryEnabled As String = Connection.GetConfigParm(configBase & "\QueryFilterFields\Employee_EnableSplitQuery").ToString()
+	If empSplitQueryEnabled.Equals("True", StringComparison.InvariantCultureIgnoreCase) Then
+		strXMLDocEmp = CCC_Aurion_QUERY_TO_XML(loggerName, P_TOKEN, QUERY_ID, filter, importSource)
+	Else
+		CCC_NLog_WriteLog(loggerName, "Debug", "Employee Filter Disabled! Executing Full Query")
+		strXMLDocEmp = CCC_Aurion_QUERY_TO_XML(loggerName, P_TOKEN, QUERY_ID, String.Empty, importSource)
+	End If
+	
+	Try
+		xmlDocEmp.LoadXml(strXMLDocEmp)
+	Catch ex As Exception
+		Dim strErrorMsg As StringBuilder = New StringBuilder
+		strErrorMsg.AppendLine("Error loading XML.")
+		strErrorMsg.AppendLine(ex.Message())
+		' Disconnect Web Service
+		CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN, importSource)")
+		CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+		' Throw error
+		CCC_NLog_WriteLog(loggerName, "Fatal", strErrorMsg.ToString())
+		Throw New AdHocDataException("Error loading XML. " & strErrorMsg.ToString())
+	End Try
+
+
+	' 29/06/2022 - Brian Pack - Split Query For Supervisor
+	' Perform Supervisor Query to XML Document
+	Dim splitQueryEnabled As String = Connection.GetConfigParm(configBase & "\QueryFilterFields\Supervisor_EnableSplitQuery").ToString()
+	QUERY_ID = Connection.GetConfigParm(configBase & "\QueryFilterFields\QueryIDs\Supervisors").ToString()
+	If splitQueryEnabled.Equals("True", StringComparison.InvariantCultureIgnoreCase) Then
+		Dim filterSup As String = CCC_Person_Import_Supervisor_Filter(loggerName, importSource)
+		strXMLDocSup = CCC_Aurion_QUERY_TO_XML(loggerName, P_TOKEN, QUERY_ID, filterSup, importSource)
+	Else
+		strXMLDocSup = CCC_Aurion_QUERY_TO_XML(loggerName, P_TOKEN, QUERY_ID, String.Empty, importSource)
+	End If
+	
+	Try
+		xmlDocSup.LoadXml(strXMLDocSup)
+	Catch ex As Exception
+		Dim strErrorMsg As StringBuilder = New StringBuilder
+		strErrorMsg.AppendLine("Error loading XML.")
+		strErrorMsg.AppendLine(ex.Message())
+		' Disconnect Web Service
+		CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN, importSource)")
+		CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+		' Throw error
+		CCC_NLog_WriteLog(loggerName, "Fatal", strErrorMsg.ToString())
+		Throw New AdHocDataException("Error loading XML. " & strErrorMsg.ToString())
+	End Try
+
+	' Disconnect Web Service
+	CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN, importSource)")
+	CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+	
+	' 20/06/2022 - Brian Pack
+	' Discard Base Records if a SUPS exists. Prevents deactivation when empty base is processed.
+	' <Actual_Placement_Type>SUBS</Actual_Placement_Type>
+	' compare with persons in xml doc
+	CCC_NLog_WriteLog(loggerName, "Debug", "Identify Additional Records")
+	
+	' personSUBS Will be used in main XML processing
+	Dim personSUBS As List(Of String) = New List(Of String)
+	Dim personBase As List(Of String) = New List(Of String)
+	Dim duplicates As List(Of String) = New List(Of String)
+	For Each node As System.Xml.XmlElement In xmlDocEmp.DocumentElement
+		Dim strPerNumber As String = node.Item("Person_Number").InnerText
+		Dim strActPlaceType As String = node.Item("Actual_Placement_Type").InnerText
+		
+		'If Duplicate
+		If personSUBS.contains(strPerNumber) And Not String.IsNullOrEmpty(strActPlaceType) Then
+			duplicates.add(strPerNumber)
+		End If
+		If personBase.contains(strPerNumber) And String.IsNullOrEmpty(strActPlaceType) Then
+			duplicates.add(strPerNumber)
+		End If
+		
+		' Check for substantive position
+		If Not String.IsNullOrEmpty(strActPlaceType) Then
+			personSUBS.add(strPerNumber)
+		Else	
+			personBase.add(strPerNumber)
+		End If
+		
+	Next
+	' *** End Patch 20/06/2022
+	
+	' 09/06/2023 - Brian Pack Log Duplicate Records
+	If duplicates.count > 0 Then
+		Dim strDuplicates As StringBuilder = New StringBuilder
+		strDuplicates.AppendLine("AURION - CCC_Person_Import_Employment - Duplicates Detected (WAMI): ")
+		For Each id In duplicates
+			strDuplicates.AppendLine(id)
+		Next
+		CCC_NLog_WriteLog(loggerName, "Info", strDuplicates.ToString())
+		RaiseMessage(MsgSeverity.Info, strDuplicates.ToString())		
+	End If
+	
+	' Main processing
+	RaiseMessage(MsgSeverity.Info, "AURION - CCC_Person_Import_Employment - Starting snychronisation")
+	' load persons from DB
+	Dim dbPersons As IColDbObject = Connection.CreateCol("Person")
+	dbPersons.Prototype.PutValue("ImportSource", importSource)
+	dbPersons.Prototype.WhereClause = "CCC_HireTransNumber IS NULL AND ImportSource = '" & importSource & "'"
+	dbPersons.Prototype("UID_Person").IsDisplayItem = True
+	dbPersons.Prototype("PersonnelNumber").IsDisplayItem = True
+	dbPersons.Prototype("CCC_EmployeeNumber").IsDisplayItem = True
+	dbPersons.Prototype("IsInActive").IsDisplayItem = True
+	'CCC_NLog_WriteLog(loggerName, "Debug", "Load Person.CCC_HireTransNumber IS NULL")
+	dbPersons.Load()
+	Dim dbPersonIDs As ArrayList = New ArrayList
+	Dim dbActivePersonIDs As ArrayList = New ArrayList
+	Dim xmlPersonIDs As ArrayList = New ArrayList
+	For Each dbPerson In dbPersons
+		dbPersonIDs.Add(dbPerson.GetValue("PersonnelNumber").ToString())
+		If dbPerson.GetValue("IsInActive").ToString.ToUpperInvariant() = "FALSE" Then
+			dbActivePersonIDs.Add(dbPerson.GetValue("PersonnelNumber").ToString())
+		End If
+	Next
+	
+	' Quota check of Aurion users in xml against active person objects (too few Aurion records versus 1IM - stops mass deactivate)
+	Dim AurionUserCount As Integer = xmlDocEmp.DocumentElement.ChildNodes.Count
+	Dim ActivePersonCount As Integer = dbActivePersonIDs.Count
+	Dim QuotaPercentage As Double = Convert.ToDouble(Connection.GetConfigParm(configBase & "\Quotas\EmpDisable\EmpDisableMinPercent").ToString)
+	Dim QuotaPersonCount As Double = ActivePersonCount * (QuotaPercentage / 100)
+	If Connection.GetConfigParm(configBase & "\Quotas\EmpDisable") = "1" Then
+		If AurionUserCount < QuotaPersonCount Then
+			Dim strErrorMsg As StringBuilder = New StringBuilder
+			strErrorMsg.AppendLine("Error with Employment sync.")
+			strErrorMsg.AppendLine(String.Format("Count of users in Aurion XML ({0}) is less then minimum qouta of active Person objects ({1}).", AurionUserCount.ToString, QuotaPersonCount.ToString))
+			CCC_NLog_WriteLog(loggerName, "Fatal", strErrorMsg.ToString())
+			RaiseMessage(MsgSeverity.Serious, "AURION - CCC_Person_Import_Employment " & vbCrLf & strErrorMsg.ToString())
+			Throw New AdHocDataException(String.Format("Error with Employment sync. Count of users in Aurion XML ({0}) is less then minimum qouta of active Person objects ({1}).", AurionUserCount.ToString, QuotaPersonCount.ToString))
+		End If
+	End If
+	' compare with persons in xml doc
+	CCC_NLog_WriteLog(loggerName, "Debug", "Loop through Employee XML")
+	For Each node As System.Xml.XmlElement In xmlDocEmp.DocumentElement
+		Dim strPerNumber As String = node.Item("Person_Number").InnerText
+		Dim strSurname As String = node.Item("Surname").InnerText
+		Dim strGivenNames As String = node.Item("Given_Names").InnerText
+		Dim strPrefFirstName As String = node.Item("Preferred_Name").InnerText
+		Dim strSalutation As String = node.Item("Salutation").InnerText
+		Dim strEmpNumber As String = node.Item("Employee_Number").InnerText
+		Dim strEmpTypeCode As String = node.Item("Employment_Type_Code").InnerText
+		Dim strStartDate As String = node.Item("Date_Commenced").InnerText
+		Dim strConExpiryDate As String = node.Item("Contract_Expiry_Date").InnerText
+		Dim strTermDate As String = node.Item("Date_Terminated").InnerText
+		Dim strEmpStatus As String = node.Item("Employee_Status").InnerText
+		Dim strOnLeaveBool As String = node.Item("Currently_on_Leave_Flag").InnerText
+		Dim strActPosNumber As String = node.Item("Actual_Position_Number").InnerText
+		Dim strPlacePosNumber As String = node.Item("Placement_Position_Number").InnerText
+		Dim strActPlaceType As String = node.Item("Actual_Placement_Type").InnerText
+		Dim strFax As String = node.Item("Fax").InnerText.Replace(" ","")	
+		Dim strNameFormat As String = node.Item("Name_For_Headings_Format").InnerText
+		Dim strWorkMobile As String = node.Item("Work_Mobile").InnerText
+		Dim strLeaveDateFrom As String = node.Item("Leave_Date_From").InnerText
+		Dim strLeaveDateTo As String = node.Item("Leave_Date_To").InnerText
+		Dim strLeaveResume As String = node.Item("Leave_Resume_Duties_Date").InnerText
+		Dim strRatingLevel As String = node.Item("Rating_Level_Code").InnerText
+		Dim strClearanceTo As String = node.Item("Clearance_Date_To").InnerText
+
+		' Import Source Specific Issues
+		Dim strCompany As String = ""
+		If node.Item("Company") Is Nothing Then
+			strCompany = Connection.GetConfigParm(configBase & "\CompanyCode").ToString()
+		Else
+			strCompany = node.Item("Company").InnerText
+		End If
+		
+		' 08/08/2023 - Brian Pack
+		' DCCEEW Specific Source - Leave Type Code
+		Dim strLeaveCode As String = ""
+		If Not node.Item("Leave_Type_Code") Is Nothing Then
+			strLeaveCode = node.Item("Leave_Type_Code").InnerText
+		End If
+		' End Update
+		
+		Dim personNumberPrefix As String = Connection.GetConfigParm(configBase & "\PersonnelNumberPrefix").ToString()
+		strPerNumber = personNumberPrefix & strPerNumber
+		strEmpNumber = personNumberPrefix & strEmpNumber
+		strActPosNumber = personNumberPrefix & strActPosNumber
+		strPlacePosNumber = personNumberPrefix & strPlacePosNumber
+		
+		xmlPersonIDs.Add(strPerNumber)
+		
+		' 20/06/2022 - Brian Pack
+		' Discard Base Records if a SUPS exists. (SEE ABOVE)
+		CCC_NLog_WriteLog(loggerName, "Debug", "Identify Additional Records")
+		If (String.IsNullOrEmpty(strActPlaceType) And personSUBS.contains(strPerNumber)) Then
+			'Skip Record
+			CCC_NLog_WriteLog(loggerName, "Debug", "Base Record Skipped. Use Actual Placement: " & strPerNumber)
+		' *** End Patch 20/06/2022
+		Else If dbPersonIDs.Contains(strPerNumber) Then
+			Try
+				' person exists in OneIM. Update attributes if needed
+				dbPersons.Clear()
+				dbPersons.Prototype.WhereClause = "PersonnelNumber = '" & strPerNumber & "' AND ImportSource = '" & importSource & "'"
+				CCC_NLog_WriteLog(loggerName, "Debug", "Load existing Person.PersonnelNumber = '" & strPerNumber & "'")
+				dbPersons.Load()
+				Dim singleObj As ISingleDbObject = dbPersons(0).Create()
+				' Name Changes
+				Dim chgUIDPerson As String = singleObj.GetValue("UID_Person").ToString
+				Dim chgFirstName As String = String.Empty
+				Dim chgLastName As String = String.Empty
+				Dim chgPreferredName As String = String.Empty
+				Dim chgMail As String = String.Empty
+				Dim old_uidOrg As String = singleObj.GetValue("UID_ORG").ToString
+				' Track Changes
+				Dim trackChanges As StringBuilder = New StringBuilder()
+				Dim trackChangesChanged = False
+				Dim trackChangesEnabled = String.Equals("True", Connection.GetConfigParm("LogAttributeChangesInEmployeeSync").ToString(), StringComparison.CurrentCultureIgnoreCase)
+				
+				CCC_NLog_WriteLog(loggerName, "Debug", "Loop through Employee node")
+				For Each nodeItem As System.Xml.XmlElement In node
+					' compare attribute values between XML doc and DB object
+					Select Case LCase(nodeItem.Name)
+						Case "surname"
+							chgLastName = strSurname
+						Case "given_names"
+							Dim regexMatch As Match = Regex.Match(strGivenNames, "(.+)\s(.+)")
+							Dim firstName As String = String.Empty
+							Dim middleName As String = String.Empty
+							If regexMatch.Success Then
+								' multiple names
+								Dim fnames As String() = Regex.Split(strGivenNames, "([^\s]+)")
+								Dim count As Integer = 0
+								For Each fname In fnames
+									fname = fname.Trim
+									If (fname.Length() > 0) AndAlso (fname <> " ") Then
+										If count = 0 Then
+											firstName = fname
+										Else
+											If middleName.Length() = 0 Then
+												middleName = fname
+											Else
+												middleName = middleName & " " & fname
+											End If
+										End If
+										count = count + 1
+									End If
+								Next
+							Else
+								' single name
+								firstName = strGivenNames
+							End If
+							chgFirstName = firstName
+							If (singleObj.GetValue("MiddleName").ToString <> middleName) Then
+								singleObj.PutValue("MiddleName", middleName)
+								trackChangesChanged = True
+							End If
+						Case "preferred_name"
+							chgPreferredName = strPrefFirstName
+						Case "name_for_headings_format"
+							If (singleObj.GetValue("CustomProperty01").ToString <> strNameFormat) Then
+								singleObj.PutValue("CustomProperty01", strNameFormat)
+								trackChangesChanged = True
+							End If
+						Case "salutation"
+							If (singleObj.GetValue("CustomProperty02").ToString <> strSalutation) Then
+								singleObj.PutValue("CustomProperty02", strSalutation)
+								trackChangesChanged = True
+							End If
+						Case "employment_type_code"
+							If (singleObj.GetValue("CCC_EmploymentType").ToString.ToUpperInvariant() <> strEmpTypeCode.ToUpperInvariant()) Then
+								singleObj.PutValue("CCC_EmploymentType", strEmpTypeCode)
+								trackChangesChanged = True
+							End If
+						Case "currently_on_leave_flag"
+							If (singleObj.GetValue("CustomProperty04").ToString.ToUpperInvariant() <> strOnLeaveBool.ToUpperInvariant()) Then
+								singleObj.PutValue("CustomProperty04", strOnLeaveBool)
+								trackChangesChanged = True
+							End If
+						Case "actual_placement_type"
+							If (singleObj.GetValue("CustomProperty05").ToString.ToUpperInvariant() <> strActPlaceType.ToUpperInvariant()) Then
+								singleObj.PutValue("CustomProperty05", strActPlaceType)
+								trackChangesChanged = True
+							End If
+						Case "fax"
+							If (singleObj.GetValue("Fax").ToString.ToUpperInvariant() <> strFax.ToUpperInvariant()) Then
+								singleObj.PutValue("Fax", strFax)
+								trackChangesChanged = True
+							End If                                  
+						Case "date_commenced"
+							If strStartDate <> "" Then
+								Dim dtStartDate As DateTime = DateTime.ParseExact(strStartDate, "dd/MM/yyyy", System.Globalization.DateTimeFormatInfo.InvariantInfo)
+								singleObj.PutValue("EntryDate", dtStartDate)
+								trackChangesChanged = True
+							End If
+						Case "contract_expiry_date"
+							' 14/06/2022 - Brian Pack - Add an override option for exit date
+							' 27/02/2023 - Brian Pack - Add additional day to end date so accounts terminate Midnight of last day.
+							If strConExpiryDate <> "" AndAlso String.IsNullOrWhiteSpace(singleObj.GetValue("CCC_TermTransNumber").ToString) Then
+								Dim dtConExpiryDate As DateTime = DateTime.ParseExact(strConExpiryDate, "dd/MM/yyyy", System.Globalization.DateTimeFormatInfo.InvariantInfo).AddDays(1)
+								singleObj.PutValue("CCC_ExitDate", dtConExpiryDate)
+								singleObj.PutValue("ExitDate", dtConExpiryDate)	
+								trackChangesChanged = True
+							ElseIf String.IsNullOrWhiteSpace(singleObj.GetValue("CCC_TermTransNumber").ToString) Then
+								singleObj.PutValue("CCC_ExitDate", DbVal.MinDate)
+								singleObj.PutValue("ExitDate", DbVal.MinDate)
+								trackChangesChanged = True
+							End If
+						Case "date_terminated"
+							' 14/06/2022 - Brian Pack - Add an override option for exit date
+							If strTermDate <> "" Then
+								Dim dtTermDate As DateTime = DateTime.ParseExact(strTermDate, "dd/MM/yyyy", System.Globalization.DateTimeFormatInfo.InvariantInfo).AddDays(1)
+								singleObj.PutValue("CCC_ExitDate", dtTermDate)
+								singleObj.PutValue("ExitDate", dtTermDate)
+								trackChangesChanged = True
+							End If
+						Case "employee_status"
+							If singleObj.GetValue("ExitDate").Date <> DbVal.MinDate Then
+								If singleObj.GetValue("ExitDate").Date.AddHours(22) < DateTime.Now Then
+									singleObj.PutValue("IsInActive", "True")
+								Else
+									If Not (strEmpStatus.ToUpperInvariant() = "ACTIVE") Then
+										singleObj.PutValue("IsInActive", "True")
+									Else
+										singleObj.PutValue("IsInActive", "False")
+									End If
+								End If
+							Else
+								If Not (strEmpStatus.ToUpperInvariant() = "ACTIVE") Then
+									singleObj.PutValue("IsInActive", "True")
+								Else
+									singleObj.PutValue("IsInActive", "False")
+								End If
+							End If
+						Case "actual_position_number"
+							If strActPosNumber.Length() > 1 Then
+								Dim dbPosGUID As String = Connection.GetSingleProperty("Org", "UID_Org", "Ident_Org = '" & strActPosNumber & "' AND ImportSource = '" & importSource & "'")
+								singleObj.PutValue("UID_Org", dbPosGUID)
+							Else
+								'ElseIf singleObj.GetValue("UID_Org").ToString.Length() > 1 Then
+								' uid_org has value, actual position number is empty. check placement position
+								If strPlacePosNumber.Length() > 1 Then
+									Dim dbPlacePOSGUID As String = Connection.GetSingleProperty("Org", "UID_Org", "Ident_Org = '" & strPlacePosNumber & "' AND ImportSource = '" & importSource & "'")
+									singleObj.PutValue("UID_Org", dbPlacePOSGUID)
+								Else
+									' actual and placement positions are empty, uid_org has value so need to remove it
+									singleObj.PutValue("UID_Org", "")
+								End If
+							End If
+						Case "placement_position_number"
+							If strPlacePosNumber.Length() > 1 Then
+								Dim dbPlacePosGUID As String = Connection.GetSingleProperty("Org", "UID_Org", "Ident_Org = '" & strPlacePosNumber & "' AND ImportSource = '" & importSource & "'")
+								If strPlacePosNumber = strActPosNumber Then
+									singleObj.PutValue("UID_Org", dbPlacePosGUID)
+									Dim oldXObjKey As String = Connection.GetSingleProperty("PersonInOrg", "XObjectKey", "UID_Person = '" & singleObj.GetValue("UID_Person").ToString() & "' AND " & "UID_Org in (select UID_Org from Org where UID_OrgRoot in " & "(select UID_OrgRoot from OrgRoot where Ident_OrgRoot = 'Positions') AND ImportSource = '" & importSource & "')")
+									If oldXObjKey.Length() > 1 Then
+										Dim dbObjKey As DbObjectKey = New DbObjectKey(oldXObjKey)
+										Dim entryToDelete As ISingleDbObject = Connection.CreateSingle(dbObjKey)
+										entryToDelete.Delete()
+										entryToDelete.Save()
+									End If	
+								Else
+									' actual must have changed, so the value of UID_Org will change. need to add into PersonInOrg if not already there
+									If Not (Connection.Exists("PersonInOrg", "UID_Person = '" & singleObj.GetValue("UID_Person").ToString() & "' AND UID_Org = '" & dbPlacePosGUID & "'")) Then
+										' add into PersonInOrg
+										Dim newPIO As ISingleDbObject = Connection.CreateSingle("PersonInOrg")
+										newPIO.PutValue("UID_Person", singleObj.GetValue("UID_Person"))
+										newPIO.PutValue("UID_Org", dbPlacePosGUID)
+									End If
+									' check if there is an old PIO entry to remove
+									Dim oldXObjKey As String = Connection.GetSingleProperty("PersonInOrg", "XObjectKey", "UID_Person = '" & singleObj.GetValue("UID_Person").ToString() & "' AND " & "UID_Org <> '" & dbPlacePosGUID & "' AND " & "UID_Org in (select UID_Org from Org where UID_OrgRoot in " & "(select UID_OrgRoot from OrgRoot where Ident_OrgRoot = 'Positions')  AND ImportSource = '" & importSource & "')")
+									If oldXObjKey.Length() > 1 Then
+										Dim dbObjKey As DbObjectKey = New DbObjectKey(oldXObjKey)
+										Dim entryToDelete As ISingleDbObject = Connection.CreateSingle(dbObjKey)
+										entryToDelete.Delete()
+										entryToDelete.Save()
+									End If
+								End If
+							End If
+							' 30/04/2024_KG_Check if CCC_UID_Org_SUBS has been changed
+							If strPlacePosNumber.Length() > 1 Then
+								Dim dbPlacePosGUID As String = Connection.GetSingleProperty("Org", "UID_Org", "Ident_Org = '" & strPlacePosNumber & "' AND ImportSource = '" & importSource & "'")
+								If (singleObj.GetValue("CCC_UID_Org_SUBS").ToString <> dbPlacePosGUID)
+									singleObj.PutValue("CCC_UID_Org_SUBS", dbPlacePosGUID)
+								End If
+							End If
+						Case "work_mobile"
+							If (singleObj.GetValue("CCC_WorkMobile").ToString <> strWorkMobile) Then
+								singleObj.PutValue("CCC_WorkMobile", strWorkMobile)
+								trackChangesChanged = True
+							End If
+						Case "rating_level_code"
+							If (singleObj.GetValue("CCC_RatingLevelCode").ToString <> strRatingLevel) Then
+								singleObj.PutValue("CCC_RatingLevelCode", strRatingLevel)
+								trackChangesChanged = True
+							End If
+						Case "clearance_date_to"
+							If strClearanceTo <> "" Then
+								Dim dtClearanceTo As DateTime = DateTime.ParseExact(strClearanceTo, "dd/MM/yyyy", System.Globalization.DateTimeFormatInfo.InvariantInfo)
+								singleObj.PutValue("CCC_ClearanceTo", dtClearanceTo)
+							Else
+								singleObj.PutValue("CCC_ClearanceTo", DbVal.MinDate)
+							End If
+						Case "leave_date_from"
+							If strLeaveDateFrom <> "" Then
+								Dim dtLeaveDateFrom As DateTime = DateTime.ParseExact(strLeaveDateFrom, "dd/MM/yyyy", System.Globalization.DateTimeFormatInfo.InvariantInfo)
+								singleObj.PutValue("CCC_LeaveStart", dtLeaveDateFrom)
+							Else
+								singleObj.PutValue("CCC_LeaveStart", DbVal.MinDate)
+							End If
+						Case "leave_date_to"
+							If strLeaveDateTo <> "" Then
+								Dim dtLeaveDateTo As DateTime = DateTime.ParseExact(strLeaveDateTo, "dd/MM/yyyy", System.Globalization.DateTimeFormatInfo.InvariantInfo)
+								singleObj.PutValue("CCC_LeaveEnd", dtLeaveDateTo)
+							Else
+								singleObj.PutValue("CCC_LeaveEnd", DbVal.MinDate)
+							End If
+						Case "leave_resume_duties_date"
+							If strLeaveResume <> "" Then
+								Dim dtLeaveResume As DateTime = DateTime.ParseExact(strLeaveResume, "dd/MM/yyyy", System.Globalization.DateTimeFormatInfo.InvariantInfo)
+								singleObj.PutValue("CCC_LeaveResume", dtLeaveResume)
+							Else
+								singleObj.PutValue("CCC_LeaveResume", DbVal.MinDate)
+							End If
+						Case "employee_number"
+							If (singleObj.GetValue("CCC_EmployeeNumber").ToString <> strEmpNumber) Then
+								singleObj.PutValue("CCC_EmployeeNumber", strEmpNumber)
+								trackChangesChanged = True
+							End If
+						Case "company"
+							If (singleObj.GetValue("CCC_Company").ToString.ToUpperInvariant() <> strCompany.ToUpperInvariant()) Then
+								singleObj.PutValue("CCC_Company", strCompany)
+								trackChangesChanged = True
+								chgMail = "CHANGED"
+							End If
+						Case "leave_type_code"
+							If (singleObj.GetValue("CCC_LeaveCode").ToString.ToUpperInvariant() <> strLeaveCode.ToUpperInvariant()) Then
+								singleObj.PutValue("CCC_LeaveCode", strLeaveCode)
+								trackChangesChanged = True
+							End If	
+					End Select	
+					
+					' 09/06/23 - BP - Track Attribute Changes
+					If trackChangesChanged Then
+						trackChanges.Append(LCase(nodeItem.Name) & ", ")
+						trackChangesChanged = False
+					End If
+				Next
+
+				CCC_NLog_WriteLog(loggerName, "Debug", "Loop through Supervisor XML")
+				For Each node2 As System.Xml.XmlElement In xmlDocSup.DocumentElement
+					Dim strPerNumber2 As String = node2.Item("Person_Number").InnerText
+					Dim strSupPerNumber As String = node2.Item("Supervisor_Person_Number").InnerText
+					Dim strEmpNumber2 As String = node2.Item("Employee_Number").InnerText
+					If (singleObj.GetValue("PersonnelNumber").ToString = strPerNumber2) AndAlso (singleObj.GetValue("CCC_EmployeeNumber").ToString = strEmpNumber2) Then
+						Dim strSupervisorUID As String = Connection.GetSingleProperty("Person", "UID_Person", String.Format("PersonnelNumber = '{0}'", strSupPerNumber))
+						If (singleObj.GetValue("UID_PersonHead").ToString <> strSupervisorUID) Then
+							singleObj.PutValue("UID_PersonHead", strSupervisorUID)
+							Exit For
+						End If
+					End If
+				Next
+				
+				If singleObj.IsChanged() = True Then
+					' person's attribute values have changed. Save the record to the DB
+					CCC_NLog_WriteLog(loggerName, "Debug", "Updating Person")
+					
+					If trackChangesEnabled Then
+						CCC_NLog_WriteLog(loggerName, "Debug", "Partial Attribute List: " & trackChanges.ToString())
+					End If
+					
+					singleObj.Save()
+					intUpdatedObjs = intUpdatedObjs + 1
+				End If
+				
+				Dim chgOrg As Boolean = String.Equals(old_UIDOrg, singleObj.GetValue("UID_ORG").ToString)
+				If Not String.IsNullOrEmpty(chgFirstName) Or Not String.IsNullOrEmpty(chgLastName) Or Not String.IsNullOrEmpty(chgPreferredName) Or Not String.IsNullOrEmpty(chgMail) Or Not chgOrg  Then
+					Dim uidDepartment As String = Connection.GetSingleProperty("Person", "UID_Department", "UID_Person = '" & chgUIDPerson & "' AND ImportSource = '" & importSource & "'")
+					Dim deptFullPath As String = Connection.GetSingleProperty("Department", "FullPath", "UID_Department = '" & uidDepartment & "' AND ImportSource = '" & importSource & "'")
+					Dim companyOverride As String = Connection.GetSingleProperty("Person", "CCC_Company_Override", "UID_Person = '" & chgUIDPerson & "' AND ImportSource = '" & importSource & "'")
+					Dim companyValue As String = If(String.IsNullOrEmpty(companyOverride), strCompany, companyOverride)
+					
+					Dim chgResult As String = CCC_Person_Name_Change(chgUIDPerson, chgFirstName, chgLastName, chgPreferredName, companyValue, deptFullPath, singleObj)
+					CCC_NLog_WriteLog(loggerName, "Debug", "Name Change Check Result: " & chgResult)
+				End If
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error updating person attributes.")
+				strErrorMsg.AppendLine("Person ID: " & strPerNumber)
+				strErrorMsg.AppendLine(ex.Message())
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_Person_Import_Employment " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		Else
+			Try
+				' person not in OneIM. Create it
+				CCC_NLog_WriteLog(loggerName, "Debug", "New Person")
+				Dim newDbObject As ISingleDbObject = Connection.CreateSingle("Person")
+				newDbObject.PutValue("ImportSource", importSource)
+				newDbObject.PutValue("PersonnelNumber", strPerNumber)
+				newDbObject.PutValue("LastName", strSurname)
+				
+				Dim regexMatch As Match = Regex.Match(strGivenNames, "(.+)\s(.+)")
+				If regexMatch.Success Then
+					' multiple names
+					Dim fnames As String() = Regex.Split(strGivenNames, "([^\s]+)")
+					Dim middleName As String = String.Empty
+					Dim count As Integer = 0
+					For Each fname In fnames
+						fname = fname.Trim
+						If (fname.Length() > 0) AndAlso (fname <> " ") Then
+							If count = 0 Then
+								newDbObject.PutValue("FirstName", fname)
+							Else
+								If middleName.Length() = 0 Then
+									middleName = fname
+								Else
+									middleName = middleName & " " & fname
+								End If
+							End If
+							count = count + 1
+						End If
+					Next
+					newDbObject.PutValue("MiddleName", middleName)
+				Else
+					' single name
+					newDbObject.PutValue("FirstName", strGivenNames)
+				End If
+				newDbObject.PutValue("PreferredName", strPrefFirstName)
+				newDbObject.PutValue("CustomProperty01", strNameFormat)
+				newDbObject.PutValue("CustomProperty02", strSalutation)
+				newDbObject.PutValue("CCC_EmployeeNumber", strEmpNumber)
+				newDbObject.PutValue("CCC_EmploymentType", strEmpTypeCode)
+				newDbObject.PutValue("CustomProperty04", strOnLeaveBool)
+				newDbObject.PutValue("CustomProperty05", strActPlaceType)
+				newDbObject.PutValue("Fax", strFax)
+				newDbObject.PutValue("CCC_WorkMobile", strWorkMobile)
+				newDbObject.PutValue("CCC_RatingLevelCode", strRatingLevel)
+				newDbObject.PutValue("CCC_Company", strCompany)
+				newDbObject.PutValue("CCC_LeaveCode", strLeaveCode)
+				
+				If strClearanceTo <> "" Then
+					Dim dtClearanceTo As DateTime = DateTime.ParseExact(strClearanceTo, "dd/MM/yyyy", System.Globalization.DateTimeFormatInfo.InvariantInfo)
+					newDbObject.PutValue("CCC_ClearanceTo", dtClearanceTo)
+				End If
+				If strLeaveDateFrom <> "" Then
+					Dim dtLeaveDateFrom As DateTime = DateTime.ParseExact(strLeaveDateFrom, "dd/MM/yyyy", System.Globalization.DateTimeFormatInfo.InvariantInfo)
+					newDbObject.PutValue("CCC_LeaveStart", dtLeaveDateFrom)
+				End If
+				If strLeaveDateTo <> "" Then
+					Dim dtLeaveDateTo As DateTime = DateTime.ParseExact(strLeaveDateTo, "dd/MM/yyyy", System.Globalization.DateTimeFormatInfo.InvariantInfo)
+					newDbObject.PutValue("CCC_LeaveEnd", dtLeaveDateTo)
+				End If
+				If strLeaveResume <> "" Then
+					Dim dtLeaveResume As DateTime = DateTime.ParseExact(strLeaveResume, "dd/MM/yyyy", System.Globalization.DateTimeFormatInfo.InvariantInfo)
+					newDbObject.PutValue("CCC_LeaveResume", dtLeaveResume)
+				End If
+				Dim dtStartDate As DateTime = DateTime.ParseExact(strStartDate, "dd/MM/yyyy", System.Globalization.DateTimeFormatInfo.InvariantInfo)
+				newDbObject.PutValue("EntryDate", dtStartDate)
+				
+				' 27/02/2023 - Brian Pack - Add additional day to end date so accounts terminate Midnight of last day.
+				If strConExpiryDate <> "" Then
+					Dim dtConExpiryDate As DateTime = DateTime.ParseExact(strConExpiryDate, "dd/MM/yyyy", System.Globalization.DateTimeFormatInfo.InvariantInfo).AddDays(1)
+					newDbObject.PutValue("CCC_ExitDate", dtConExpiryDate)
+					newDbObject.PutValue("ExitDate", dtConExpiryDate)
+				End If
+				If strTermDate <> "" Then
+					Dim dtTermDate As DateTime = DateTime.ParseExact(strTermDate, "dd/MM/yyyy", System.Globalization.DateTimeFormatInfo.InvariantInfo).AddDays(1)
+					newDbObject.PutValue("CCC_ExitDate", dtTermDate)
+					newDbObject.PutValue("ExitDate", dtTermDate)
+				End If
+				If strConExpiryDate <> "" OrElse strTermDate <> "" Then
+					If newDbObject.GetValue("ExitDate").Date.AddHours(22) < DateTime.Now Then
+						newDbObject.PutValue("IsInActive", "True")
+					Else
+						If Not (strEmpStatus.ToUpperInvariant() = "ACTIVE") Then
+							newDbObject.PutValue("IsInActive", "True")
+						End If
+					End If
+				Else
+					If Not (strEmpStatus.ToUpperInvariant() = "ACTIVE") Then
+						newDbObject.PutValue("IsInActive", "True")
+					End If
+				End If
+				
+				Dim strPrimPosGUID As String = String.Empty
+				Dim strSecPosGUID As String = String.Empty
+				If strActPosNumber = strPlacePosNumber Then
+					strPrimPosGUID = Connection.GetSingleProperty("Org", "UID_Org", "Ident_Org = '" & strActPosNumber & "' AND ImportSource = '" & importSource & "'")
+				Else
+					' actual goes into primary (UID_Org), placement into secondary (PersonInOrg)
+					strPrimPosGUID = Connection.GetSingleProperty("Org", "UID_Org", "Ident_Org = '" & strActPosNumber & "' AND ImportSource = '" & importSource & "'")
+					strSecPosGUID = Connection.GetSingleProperty("Org", "UID_Org", "Ident_Org = '" & strPlacePosNumber & "' AND ImportSource = '" & importSource & "'")
+				End If
+				newDbObject.PutValue("UID_Org", strPrimPosGUID)
+				' 30/04/2024_KG_Updating substantive position for a new user
+				If strPlacePosNumber <> ""  Then
+					strSecPosGUID = Connection.GetSingleProperty("Org", "UID_Org", "Ident_Org = '" & strPlacePosNumber & "' AND ImportSource = '" & importSource & "'")
+					newDbObject.PutValue("CCC_UID_Org_SUBS", strSecPosGUID)
+				End If
+				CCC_NLog_WriteLog(loggerName, "Debug", "Creating Person")
+				newDbObject.Save()
+				intNewObjs = intNewObjs + 1
+				If strSecPosGUID.Length() > 1 Then
+					Dim newPersInOrg As ISingleDbObject = Connection.CreateSingle("PersonInOrg")
+					newPersInOrg.PutValue("UID_Person", newDbObject.GetValue("UID_Person"))
+					newPersInOrg.PutValue("UID_Org", strSecPosGUID)
+					newPersInOrg.Save()
+				End If
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error creating a new person.")
+				strErrorMsg.AppendLine("Person ID: " & strPerNumber)
+				strErrorMsg.AppendLine(ex.Message())
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_Person_Import_Employment " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		End If
+	Next
+	' handle those which only exist in OneIM
+	Dim dbOnlyIDs As ArrayList = New ArrayList
+	For Each dbID In dbPersonIDs
+		If Not (xmlPersonIDs.Contains(dbID)) Then
+			dbOnlyIDs.Add(dbID)
+		End If
+	Next
+	If dbOnlyIDs.Count() > 0 Then
+		' items in DB which do not exist in Aurion XML feed
+		CCC_NLog_WriteLog(loggerName, "Debug", "Loop through missing Aurion Users")
+		For Each dbObjID As String In dbOnlyIDs
+			Try
+				dbPersons.Clear()
+				dbPersons.Prototype.WhereClause = "PersonnelNumber = '" & dbObjID & "' AND ImportSource = '" & importSource & "'"
+				dbPersons.Load()
+				Dim singleObj As ISingleDbObject = dbPersons(0).Create()
+				If singleObj.GetValue("IsInActive").ToString.ToUpperInvariant() = "FALSE" Then
+					singleObj.PutValue("IsInActive", "True")
+				End If
+				If singleObj.GetValue("UID_Org").ToString <> "" Then
+					singleObj.PutValue("UID_Org", "")
+					Dim oldXObjKey As String = Connection.GetSingleProperty("PersonInOrg", "XObjectKey", "UID_Person = '" & singleObj.GetValue("UID_Person").ToString() & "' AND " & "UID_Org in (select UID_Org from Org where UID_OrgRoot in " & "(select UID_OrgRoot from OrgRoot where Ident_OrgRoot = 'Positions') AND ImportSource = '" & importSource & "')")
+					If oldXObjKey.Length() > 1 Then
+						Dim dbObjKey As DbObjectKey = New DbObjectKey(oldXObjKey)
+						Dim entryToDelete As ISingleDbObject = Connection.CreateSingle(dbObjKey)
+						CCC_NLog_WriteLog(loggerName, "Debug", "Deleting PersonInOrg")
+						entryToDelete.Delete()
+						entryToDelete.Save()
+					End If
+				End If
+				If singleObj.IsChanged() = True Then
+					CCC_NLog_WriteLog(loggerName, "Debug", "Deactivating Person")
+					singleObj.Save()
+					intDeletedObjs = intDeletedObjs + 1
+				End If
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error deactivating a person.")
+				strErrorMsg.AppendLine("Person ID: " & dbObjID)
+				strErrorMsg.AppendLine(ex.Message())
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_Person_Import_Employment " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		Next
+	End If
+	' return some stats
+	Dim strWrite As StringBuilder = New StringBuilder
+	strWrite.AppendLine("AURION HR - Person Employment Import Script")
+	strWrite.AppendLine("Total persons created: " & intNewObjs)
+	strWrite.AppendLine("Total persons updated: " & intUpdatedObjs)
+	strWrite.AppendLine("Total persons deactivated: " & intDeletedObjs)
+	RaiseMessage(MsgSeverity.Info, "AURION - CCC_Person_Import_Employment " & vbCrLf & strWrite.ToString())
+	CCC_NLog_WriteLog(loggerName, "Debug", "Exiting CCC_Person_Import_Employment()")
+	Return strWrite.ToString()
+End Function
+
+''' <summary>
+''' Import of Hire Schedule from Aurion via Schedule
+''' </summary>
+''' <returns>String result message</returns>
+''' 
+Public Function CCC_Person_Import_HireSchedule(Optional ByVal importSource As String = "AUR") As String
+	Dim configBase As String = CCC_Aurion_GetConfigBase(importSource)
+	Dim loggerName As String = CCC_Aurion_GetLoggerPrefix(importSource) & "_HIRE"
+	CCC_NLog_WriteLog(loggerName, "Debug", "Entering CCC_Person_Import_HireSchedule()")
+	'
+	' This script will sync the Hire Schedule records from Aurion HR to the Person table in OneIM
+	'
+	' vars
+	Dim strRtnValue As String = String.Empty
+	Dim intNewObjs As Integer = 0
+	Dim intUpdatedObjs As Integer = 0
+	Dim intDeletedObjs As Integer = 0
+	Dim strXMLDoc As String = String.Empty
+	Dim xmlDoc As Xml.XmlDocument = New Xml.XmlDocument
+	' Initiate Web Service
+	Dim QUERY_ID As String = Connection.GetConfigParm(configBase & "\QueryFilterFields\QueryIDs\Hires").ToString()
+	Dim P_TOKEN As String = CCC_Aurion_LOGON(importSource)
+	' Perform Hire Single-Query to XML Document
+	strXMLDoc = CCC_Aurion_QUERY_TO_XML(loggerName, P_TOKEN, QUERY_ID, String.Empty, importSource)
+	' Disconnect Web Service
+	CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN, importSource)")
+	CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+	' Check if Aurion has returned 0 records - this is a valid result for Hire Schedules
+	If strXMLDoc = Connection.GetConfigParm(configBase & "\NoRecordsOutput") Then
+		Dim dbPers As IColDbObject = Connection.CreateCol("Person")
+		dbPers.Prototype.PutValue("ImportSource", importSource)
+		dbPers.Prototype.WhereClause = "CCC_HireTransNumber IS NOT NULL"
+		CCC_NLog_WriteLog(loggerName, "Debug", "Load Person.CCC_HireTransNumber IS NOT NULL")
+		dbPers.Load()
+		For Each dbPerson In dbPers
+			Dim singleObj As ISingleDbObject = dbPerson.Create()
+			singleObj.PutValue("CCC_HireTransNumber", "")
+			CCC_NLog_WriteLog(loggerName, "Debug", "Clearing Person.CCC_HireTransNumber")
+			singleObj.Save()
+			intDeletedObjs = intDeletedObjs + 1
+		Next
+		Dim strOutput As StringBuilder = New StringBuilder
+		strOutput.AppendLine("No XML produced. 0 Scheduled 'Hire Schedule' records in Aurion. Process Ended")
+		If intDeletedObjs > 0 Then
+			strOutput.AppendLine("Total person transaction numbers cleared: " & intDeletedObjs)
+		End If
+		strRtnValue = strOutput.ToString()
+		RaiseMessage(MsgSeverity.Info, "AURION - CCC_Person_Import_HireSchedule " & vbCrLf & strOutput.ToString())
+		CCC_NLog_WriteLog(loggerName, "Debug", "Exiting CCC_Person_Import_HireSchedule()")
+		Return strRtnValue
+	End If
+	' Load XML output from Aurion
+	Try
+		xmlDoc.LoadXml(strXMLDoc)
+	Catch ex As Exception
+		Dim strErrorMsg As StringBuilder = New StringBuilder
+		strErrorMsg.AppendLine("Error loading XML.")
+		strErrorMsg.AppendLine(ex.Message())
+		' Disconnect Web Service
+		CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN, importSource)")
+		CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+		' Throw error
+		CCC_NLog_WriteLog(loggerName, "Fatal", strErrorMsg.ToString())
+		Throw New AdHocDataException("Error loading XML. " & strErrorMsg.ToString())
+	End Try
+	' Main processing
+	RaiseMessage(MsgSeverity.Info, "AURION - CCC_Person_Import_HireSchedule - Starting snychronisation")
+	' SYNC WITH ONEIM OBJECTS
+	' load persons from DB
+	Dim dbPersons As IColDbObject = Connection.CreateCol("Person")
+	dbPersons.Prototype.PutValue("ImportSource", importSource)
+	dbPersons.Prototype("UID_Person").IsDisplayItem = True
+	dbPersons.Prototype("PersonnelNumber").IsDisplayItem = True
+	dbPersons.Prototype("CCC_EmployeeNumber").IsDisplayItem = True
+	dbPersons.Prototype("CCC_HireTransNumber").IsDisplayItem = True
+	CCC_NLog_WriteLog(loggerName, "Debug", "Load Person")
+	dbPersons.Load()
+	Dim dbPersonIDs As ArrayList = New ArrayList
+	Dim dbHirePersonIDs As ArrayList = New ArrayList
+	Dim xmlPersonIDs As ArrayList = New ArrayList
+	For Each dbPerson In dbPersons
+		dbPersonIDs.Add(dbPerson.GetValue("PersonnelNumber").ToString())
+		If Not String.IsNullOrWhiteSpace(dbPerson.GetValue("CCC_HireTransNumber").ToString()) Then
+			dbHirePersonIDs.Add(dbPerson.GetValue("PersonnelNumber").ToString())
+		End If
+	Next
+	' compare with persons in xml doc
+	CCC_NLog_WriteLog(loggerName, "Debug", "Loop through XML")
+	For Each node As System.Xml.XmlElement In xmlDoc.DocumentElement
+		Dim strPerNumber As String = node.Item("Person_Number").InnerText
+		Dim strSurname As String = node.Item("Surname").InnerText
+		Dim strGivenNames As String = node.Item("Given_Names").InnerText
+		Dim strPrefFirstName As String = node.Item("Preferred_Name").InnerText
+		Dim strSalutation As String = node.Item("Salutation").InnerText
+		Dim strEmpNumber As String = node.Item("Employee_Number").InnerText
+		Dim strDateEffect As String = node.Item("Date_Effective").InnerText
+		Dim strPosNumber As String = node.Item("Position_Number").InnerText
+		Dim strEmpTypeCode As String = node.Item("Employment_Type_Code").InnerText
+		Dim strTransactNumber As String = node.Item("Transaction_Number").InnerText
+		Dim strFax As String = node.Item("Fax").InnerText.Replace(" ","")
+		Dim strNameFormat As String = node.Item("Name_For_Headings_Format").InnerText
+		Dim strWorkMobile As String = node.Item("Work_Mobile").InnerText
+		Dim strRatingLevel As String = node.Item("Rating_Level_Code").InnerText
+		Dim strClearanceTo As String = node.Item("Clearance_Date_To").InnerText
+		
+		' Import Source Specific Issues
+		Dim strCompany As String = ""
+		If node.Item("Company") Is Nothing Then
+			strCompany = Connection.GetConfigParm(configBase & "\CompanyCode").ToString()
+		Else
+			strCompany = node.Item("Company").InnerText
+		End If
+			
+		Dim personNumberPrefix As String = Connection.GetConfigParm(configBase & "\PersonnelNumberPrefix").ToString()
+		strPerNumber = personNumberPrefix & strPerNumber
+		strEmpNumber = personNumberPrefix & strEmpNumber
+		strPosNumber = personNumberPrefix & strPosNumber
+		
+		xmlPersonIDs.Add(strPerNumber)
+		If dbPersonIDs.Contains(strPerNumber) Then
+			Try
+				' person exists in OneIM. Update attributes if needed
+				dbPersons.Clear()
+				dbPersons.Prototype.WhereClause = "PersonnelNumber = '" & strPerNumber & "' AND ImportSource = '" & importSource & "'"
+				CCC_NLog_WriteLog(loggerName, "Debug", "Load existing Person.PersonnelNumer = '" & strPerNumber & "'  AND ImportSource = '" & importSource & "'")
+				dbPersons.Load()
+				Dim singleObj As ISingleDbObject = dbPersons(0).Create()
+				' Name Changes
+				Dim chgUIDPerson As String = singleObj.GetValue("UID_Person").ToString
+				Dim chgFirstName As String = String.Empty
+				Dim chgLastName As String = String.Empty
+				Dim chgPreferredName As String = String.Empty
+				Dim old_uidOrg As String = singleObj.GetValue("UID_ORG").ToString
+				Dim chgMail As String = String.Empty
+				' Checks if the user already has an active employment - if so then do not add data from the Hire Schedule
+				If Not CBool(singleObj.GetValue("IsInActive")) AndAlso String.IsNullOrWhiteSpace(singleObj.GetValue("CCC_HireTransNumber").ToString) Then
+					Continue For
+				Else
+					' If user already exists (and IsInActive) in OneIM and now has Hire Schedule record - Activate User, assign CCC_HireTransNumber and remove ExitDate
+					If CBool(singleObj.GetValue("IsInActive")) Then
+						singleObj.PutValue("IsInActive", "False")
+					End If
+					If String.IsNullOrWhiteSpace(singleObj.GetValue("CCC_HireTransNumber").ToString) Then
+						singleObj.PutValue("CCC_HireTransNumber", strTransactNumber)
+					End If
+					' 27/07/2022 - Brian Pack - Add an override option for exit date
+					If singleObj.GetValue("ExitDate").Date <> DbVal.MinDate Then
+						singleObj.PutValue("CCC_ExitDate_Override", DbVal.MinDate)
+						singleObj.PutValue("CCC_ExitDate", DbVal.MinDate)
+						singleObj.PutValue("ExitDate", DbVal.MinDate)
+					End If
+				End If
+				CCC_NLog_WriteLog(loggerName, "Debug", "Loop through node")
+				For Each nodeItem As System.Xml.XmlElement In node
+					' compare attribute values between XML doc and DB object
+					Select Case LCase(nodeItem.Name)
+						Case "date_effective"
+							Dim dtHREntryDate As DateTime = DateTime.ParseExact(strDateEffect, "dd/MM/yyyy", System.Globalization.DateTimeFormatInfo.InvariantInfo)
+							singleObj.PutValue("EntryDate", dtHREntryDate)
+						Case "position_number"
+							Dim dbPosGUID As String = Connection.GetSingleProperty("Org", "UID_Org", "Ident_Org = '" & strPosNumber & "'  AND ImportSource = '" & importSource & "'")
+							If dbPosGUID <> singleObj.GetValue("UID_Org") Then
+								singleObj.PutValue("UID_Org", dbPosGUID)
+							End If
+							' Insert Supervisor/Manager (UID_PersonHead) data. IAM_Supervisor report only Handles Employments, Not Hire Schedules.
+							' REMOVE the following UID_PersonHead update when Supervisor data is available in the Hire Schedule report from Aurion.
+							Dim dbSupGUID As String = Connection.GetSingleProperty("Person", "UID_Person", "UID_Org = (Select UID_ParentOrg from Org where UID_Org = '" & dbPosGUID & "'  AND ImportSource = '" & importSource & "')")
+							If dbSupGUID <> singleObj.GetValue("UID_PersonHead") Then
+								singleObj.PutValue("UID_PersonHead", dbSupGUID)
+							End If
+						Case "employment_type_code"
+							If (singleObj.GetValue("CCC_EmploymentType").ToString.ToUpperInvariant() <> strEmpTypeCode.ToUpperInvariant()) Then
+								singleObj.PutValue("CCC_EmploymentType", strEmpTypeCode)
+							End If
+						Case "surname"
+							chgLastName = strSurname
+						Case "given_names"
+							Dim regexMatch As Match = Regex.Match(strGivenNames, "(.+)\s(.+)")
+							Dim firstName As String = String.Empty
+							Dim middleName As String = String.Empty
+							If regexMatch.Success Then
+								' multiple names
+								Dim fnames As String() = Regex.Split(strGivenNames, "([^\s]+)")
+								Dim count As Integer = 0
+								For Each fname In fnames
+									fname = fname.Trim
+									If (fname.Length() > 0) AndAlso (fname <> " ") Then
+										If count = 0 Then
+											firstName = fname
+										Else
+											If middleName.Length() = 0 Then
+												middleName = fname
+											Else
+												middleName = middleName & " " & fname
+											End If
+										End If
+										count = count + 1
+									End If
+								Next
+							Else
+								' single name
+								firstName = strGivenNames
+							End If
+							chgFirstName = firstName
+							If (singleObj.GetValue("MiddleName").ToString <> middleName) Then
+								singleObj.PutValue("MiddleName", middleName)
+							End If
+						Case "preferred_name"
+							chgPreferredName = strPrefFirstName
+						Case "name_for_headings_format"
+							If (singleObj.GetValue("CustomProperty01").ToString <> strNameFormat) Then
+								singleObj.PutValue("CustomProperty01", strNameFormat)
+							End If
+						Case "salutation"
+							If (singleObj.GetValue("CustomProperty02").ToString <> strSalutation) Then
+								singleObj.PutValue("CustomProperty02", strSalutation)
+							End If
+						Case "fax"
+							If (singleObj.GetValue("Fax").ToString.ToUpperInvariant() <> strFax.ToUpperInvariant()) Then
+								singleObj.PutValue("Fax", strFax)
+							End If
+						Case "work_mobile"
+							If (singleObj.GetValue("CCC_WorkMobile").ToString <> strWorkMobile) Then
+								singleObj.PutValue("CCC_WorkMobile", strWorkMobile)
+							End If
+						Case "rating_level_code"
+							If (singleObj.GetValue("CCC_RatingLevelCode").ToString <> strRatingLevel) Then
+								singleObj.PutValue("CCC_RatingLevelCode", strRatingLevel)
+							End If
+						Case "clearance_date_to"
+							If strClearanceTo <> "" Then
+								Dim dtClearanceTo As DateTime = DateTime.ParseExact(strClearanceTo, "dd/MM/yyyy", System.Globalization.DateTimeFormatInfo.InvariantInfo)
+								singleObj.PutValue("CCC_ClearanceTo", dtClearanceTo)
+							Else
+								singleObj.PutValue("CCC_ClearanceTo", DbVal.MinDate)
+							End If
+						Case "employee_number"
+							If (singleObj.GetValue("CCC_EmployeeNumber").ToString <> strEmpNumber) Then
+								singleObj.PutValue("CCC_EmployeeNumber", strEmpNumber)
+							End If	
+						Case "company"
+							If (singleObj.GetValue("CCC_Company").ToString.ToUpperInvariant() <> strCompany.ToUpperInvariant()) Then
+								singleObj.PutValue("CCC_Company", strCompany)
+								chgMail = "CHANGED"
+							End If		
+					End Select
+				Next
+							
+				If singleObj.IsChanged() = True Then
+					' person's attribute values have changed. Save the record to the DB
+					Stop
+					CCC_NLog_WriteLog(loggerName, "Debug", "Updating Person")
+					singleObj.Save()
+					intUpdatedObjs = intUpdatedObjs + 1
+				End If
+				
+				' 08/02/2023 - Add rename processes to New Hire
+				Dim chgOrg As Boolean = String.Equals(old_UIDOrg, singleObj.GetValue("UID_ORG").ToString)
+				If Not String.IsNullOrEmpty(chgFirstName) Or Not String.IsNullOrEmpty(chgLastName) Or Not String.IsNullOrEmpty(chgPreferredName) Or Not String.IsNullOrEmpty(chgMail) Or Not chgOrg  Then
+					Dim uidDepartment As String = Connection.GetSingleProperty("Person", "UID_Department", "UID_Person = '" & chgUIDPerson & "' AND ImportSource = '" & importSource & "'")
+					Dim deptFullPath As String = Connection.GetSingleProperty("Department", "FullPath", "UID_Department = '" & uidDepartment & "' AND ImportSource = '" & importSource & "'")
+					Dim companyOverride As String = Connection.GetSingleProperty("Person", "CCC_Company_Override", "UID_Person = '" & chgUIDPerson & "' AND ImportSource = '" & importSource & "'")
+					Dim companyValue As String = If(String.IsNullOrEmpty(companyOverride), strCompany, companyOverride)
+					
+					Dim chgResult As String = CCC_Person_Name_Change(chgUIDPerson, chgFirstName, chgLastName, chgPreferredName, companyValue, deptFullPath, singleObj)
+					CCC_NLog_WriteLog(loggerName, "Debug", "Name Change Check Result: " & chgResult)
+				End If
+								
+				' 12/07/2022 - BP - CentralAccount is now immutable and should not change, even on name change.
+				'If Not String.IsNullOrEmpty(chgFirstName) Or Not String.IsNullOrEmpty(chgLastName) Or Not String.IsNullOrEmpty(chgPreferredName) Then
+				'	Dim chgResult As String = CCC_Person_Name_Change(chgUIDPerson, chgFirstName, chgLastName, chgPreferredName)
+				'	CCC_NLog_WriteLog(loggerName, "Debug", "Name Change Check Result: " & chgResult)
+				'End If
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error updating person attributes.")
+				strErrorMsg.AppendLine("Person ID: " & strPerNumber)
+				strErrorMsg.AppendLine(ex.Message())
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_Person_Import_HireSchedule " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		Else
+			Try
+				' person not in OneIM. Create it
+				CCC_NLog_WriteLog(loggerName, "Debug", "New Person")
+				Dim newDbObject As ISingleDbObject = Connection.CreateSingle("Person")
+				newDbObject.PutValue("ImportSource", importSource)
+				newDbObject.PutValue("PersonnelNumber", strPerNumber)
+				newDbObject.PutValue("LastName", strSurname)
+				Dim regexMatch As Match = Regex.Match(strGivenNames, "(.+)\s(.+)")
+				If regexMatch.Success Then
+					' multiple names
+					Dim fnames As String() = Regex.Split(strGivenNames, "([^\s]+)")
+					Dim middleName As String = String.Empty
+					Dim count As Integer = 0
+					For Each fname In fnames
+						fname = fname.Trim
+						If (fname.Length() > 0) AndAlso (fname <> " ") Then
+							If count = 0 Then
+								newDbObject.PutValue("FirstName", fname)
+							Else
+								If middleName.Length() = 0 Then
+									middleName = fname
+								Else
+									middleName = middleName & " " & fname
+								End If
+							End If
+							count = count + 1
+						End If
+
+					Next
+					newDbObject.PutValue("MiddleName", middleName)
+				Else
+					' single name
+					newDbObject.PutValue("FirstName", strGivenNames)
+				End If
+				newDbObject.PutValue("PreferredName", strPrefFirstName)
+				newDbObject.PutValue("CustomProperty01", strNameFormat)
+				newDbObject.PutValue("CustomProperty02", strSalutation) ' - salutation in Aurion is currently free text
+				newDbObject.PutValue("CCC_EmployeeNumber", strEmpNumber)
+				newDbObject.PutValue("CCC_EmploymentType", strEmpTypeCode)
+				Dim dtEntryDate As Date = Date.ParseExact(strDateEffect, "dd/MM/yyyy", System.Globalization.DateTimeFormatInfo.InvariantInfo)
+				newDbObject.PutValue("EntryDate", dtEntryDate)
+				Dim dbPrimPosGUID As String = Connection.GetSingleProperty("Org", "UID_Org", "Ident_Org = '" & strPosNumber & "' AND ImportSource = '" & importSource & "'")
+				newDbObject.PutValue("UID_Org", dbPrimPosGUID)
+				' Insert Supervisor/Manager (UID_PersonHead) data. IAM_Supervisor report only Handles Employments, Not Hire Schedules.
+				' REMOVE the following UID_PersonHead insert when Supervisor data is available in the Hire Schedule report from Aurion.
+				Dim dbPrimSupGUID As String = Connection.GetSingleProperty("Person", "UID_Person", "UID_Org = (Select UID_ParentOrg from Org where UID_Org = '" & dbPrimPosGUID & "' AND ImportSource = '" & importSource & "')")
+				newDbObject.PutValue("UID_PersonHead", dbPrimSupGUID)
+				newDbObject.PutValue("CCC_HireTransNumber", strTransactNumber)
+				newDbObject.PutValue("Fax", strFax)
+				newDbObject.PutValue("CCC_WorkMobile", strWorkMobile)
+				newDbObject.PutValue("CCC_RatingLevelCode", strRatingLevel)
+				newDbObject.PutValue("CCC_Company", strCompany)
+				If strClearanceTo <> "" Then
+					Dim dtClearanceTo As DateTime = DateTime.ParseExact(strClearanceTo, "dd/MM/yyyy", System.Globalization.DateTimeFormatInfo.InvariantInfo)
+					newDbObject.PutValue("CCC_ClearanceTo", dtClearanceTo)
+				End If
+				CCC_NLog_WriteLog(loggerName, "Debug", "Creating Person")
+				newDbObject.Save()
+				intNewObjs = intNewObjs + 1
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error creating a new person.")
+				strErrorMsg.AppendLine("Person ID: " & strPerNumber)
+				strErrorMsg.AppendLine(ex.Message())
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_Person_Import_HireSchedule " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		End If
+	Next
+	' handle those which only exist in OneIM
+	Dim dbOnlyIDs As ArrayList = New ArrayList
+	For Each dbID In dbHirePersonIDs
+		If Not (xmlPersonIDs.Contains(dbID)) Then
+			dbOnlyIDs.Add(dbID)
+		End If
+	Next
+	If dbOnlyIDs.Count() > 0 Then
+		' items in DB which do not exist in Aurion XML feed
+		CCC_NLog_WriteLog(loggerName, "Debug", "Loop through missing Aurion Users")
+		For Each dbObjID As String In dbOnlyIDs
+			Try
+				dbPersons.Clear()
+				dbPersons.Prototype.WhereClause = "PersonnelNumber = '" & dbObjID & "' AND ImportSource = '" & importSource & "'"
+				dbPersons.Load()
+				Dim singleObj As ISingleDbObject = dbPersons(0).Create()
+				singleObj.PutValue("CCC_HireTransNumber", "")
+				CCC_NLog_WriteLog(loggerName, "Debug", "Clearing Person.CCC_HireTransNumber")
+				singleObj.Save()
+				intDeletedObjs = intDeletedObjs + 1
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error deactivating a person.")
+				strErrorMsg.AppendLine("Person ID: " & dbObjID)
+				strErrorMsg.AppendLine(ex.Message())
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_Person_Import_HireSchedule " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		Next
+	End If
+	' return some stats
+	Dim strWrite As StringBuilder = New StringBuilder
+	strWrite.AppendLine("AURION HR - Person Hire Schedule Import Script")
+	strWrite.AppendLine("Total persons created: " & intNewObjs)
+	strWrite.AppendLine("Total persons updated: " & intUpdatedObjs)
+	strWrite.AppendLine("Total person transaction numbers cleared: " & intDeletedObjs)
+	strRtnValue = strWrite.ToString()
+	RaiseMessage(MsgSeverity.Info, "AURION - CCC_Person_Import_HireSchedule " & vbCrLf & strWrite.ToString())
+	CCC_NLog_WriteLog(loggerName, "Debug", "AURION - CCC_Person_Import_HireSchedule " & vbCrLf & strWrite.ToString())
+	CCC_NLog_WriteLog(loggerName, "Debug", "Exiting CCC_Person_Import_HireSchedule()")
+	Return strRtnValue
+End Function
+
+''' <summary>
+''' Import of Supervisors from Aurion via Schedule
+''' </summary>
+''' <returns>String result message</returns>
+''' 
+Public Function CCC_Person_Import_Supervisor(Optional ByVal importSource As String = "AUR") As String
+	Dim configBase As String = CCC_Aurion_GetConfigBase(importSource)
+	Dim loggerName As String = CCC_Aurion_GetLoggerPrefix(importSource) & "_SUPERVISOR"
+	CCC_NLog_WriteLog(loggerName, "Debug", "Entering CCC_Person_Import_Supervisor()")
+	'
+	' This script will sync Employee's Supervisors (Manager - UID_PersonHead) from Aurion HR to the Person table in OneIM
+	'
+	' vars
+	Dim intUpdatedSups As Integer = 0
+	Dim intRemovedSups As Integer = 0
+	Dim strXMLDoc As String = String.Empty
+	Dim xmlDoc As Xml.XmlDocument = New Xml.XmlDocument
+	
+	' Initiate Web Service
+	Dim QUERY_ID As String = Connection.GetConfigParm(configBase & "\QueryFilterFields\QueryIDs\Supervisors").ToString()
+	Dim P_TOKEN As String = CCC_Aurion_LOGON(importSource)
+	' Perform Supervisor Single-Query to XML Document
+	
+	Dim splitQueryEnabled As String = Connection.GetConfigParm(configBase & "\QueryFilterFields\Supervisor_EnableSplitQuery").ToString()
+	If splitQueryEnabled.Equals("True", StringComparison.InvariantCultureIgnoreCase) Then
+		Dim filter As String = CCC_Person_Import_Supervisor_Filter(loggerName, importSource)
+		strXMLDoc = CCC_Aurion_QUERY_TO_XML(loggerName, P_TOKEN, QUERY_ID, filter, importSource)
+	Else
+		strXMLDoc = CCC_Aurion_QUERY_TO_XML(loggerName, P_TOKEN, QUERY_ID, String.Empty, importSource)
+	End If
+	
+	Try
+		xmlDoc.LoadXml(strXMLDoc)
+	Catch ex As Exception
+		Dim strErrorMsg As StringBuilder = New StringBuilder
+		strErrorMsg.AppendLine("Error loading XML.")
+		strErrorMsg.AppendLine(ex.Message())
+		' Disconnect Web Service
+		CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN, importSource)")
+		CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+		' Throw error
+		CCC_NLog_WriteLog(loggerName, "Fatal", strErrorMsg.ToString())
+		Throw New AdHocDataException("Error loading XML. " & strErrorMsg.ToString())
+	End Try
+	' Disconnect Web Service
+	CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN, importSource)")
+	CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+	' Main processing
+	RaiseMessage(MsgSeverity.Info, "AURION - CCC_Person_Import_Supervisor - Starting snychronisation")
+	' SYNC WITH ONEIM OBJECTS
+	' load persons from DB
+	Dim dbPersons As IColDbObject = Connection.CreateCol("Person")
+	dbPersons.Prototype.PutValue("ImportSource", importSource)
+	dbPersons.Prototype.WhereClause = "IsInActive = 0"
+	dbPersons.Prototype("PersonnelNumber").IsDisplayItem = True
+	CCC_NLog_WriteLog(loggerName, "Debug", "Load Person.IsInActive = 0")
+	dbPersons.Load()
+	Dim dbPersonIDs As ArrayList = New ArrayList
+	For Each dbPerson In dbPersons
+		dbPersonIDs.Add(dbPerson.GetValue("PersonnelNumber").ToString())
+	Next
+	
+'	Dim dbPersonIDs As ArrayList = New ArrayList
+'	Dim dbHirePersonIDs As ArrayList = New ArrayList
+	Dim xmlPersonIDs As ArrayList = New ArrayList
+'	For Each dbPerson In dbPersons
+'		xmlPersonIDs.Add(dbPerson.GetValue("PersonnelNumber").ToString())
+	
+	' compare with persons in xml doc
+	CCC_NLog_WriteLog(loggerName, "Debug", "Loop through XML")
+	For Each node As System.Xml.XmlElement In xmlDoc.DocumentElement
+		Dim strPerNumber As String = node.Item("Person_Number").InnerText
+		Dim strSupPerNumber As String = node.Item("Supervisor_Person_Number").InnerText
+		Dim strEmpNumber As String = node.Item("Employee_Number").InnerText
+		
+		' Import Source Specific Issues
+		Dim personNumberPrefix As String = Connection.GetConfigParm(configBase & "\PersonnelNumberPrefix").ToString()
+		strPerNumber = personNumberPrefix & strPerNumber
+		strEmpNumber = personNumberPrefix & strEmpNumber
+		strSupPerNumber = personNumberPrefix & strSupPerNumber
+
+		' Record Person ID from XML feed
+		xmlPersonIDs.Add(strPerNumber)
+		
+		Dim strSupervisorUID As String = Connection.GetSingleProperty("Person", "UID_Person",String.Format("PersonnelNumber = '{0}'  AND ImportSource = '{1}'", strSupPerNumber, importSource))
+		If dbPersonIDs.Contains(strPerNumber) Then
+			Try
+				' person exists in OneIM. Update attributes if needed
+				dbPersons.Clear()
+				dbPersons.Prototype.WhereClause = "PersonnelNumber = '" & strPerNumber & "' AND ImportSource = '" & importSource & "'"
+				CCC_NLog_WriteLog(loggerName, "Debug", "Load existing Person.PersonnelNumer = '" & strPerNumber & "'")
+				dbPersons.Load()
+				Dim singleObj As ISingleDbObject = dbPersons(0).Create()
+				If (singleObj.GetValue("CCC_EmployeeNumber").ToString = strEmpNumber) Then
+					If (singleObj.GetValue("UID_PersonHead").ToString <> strSupervisorUID) Then
+						singleObj.PutValue("UID_PersonHead", strSupervisorUID)
+					End If
+				End If
+				If singleObj.IsChanged() = True Then
+					' person's attribute values have changed. Save the record to the DB
+					Stop
+					CCC_NLog_WriteLog(loggerName, "Debug", "Updating Person")
+					singleObj.Save()
+					If String.IsNullOrWhiteSpace(strSupervisorUID) Then
+						intRemovedSups = intRemovedSups + 1
+					Else
+						intUpdatedSups = intUpdatedSups + 1
+					End If
+				End If
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error updating person's supervisor.")
+				strErrorMsg.AppendLine("Person ID: " & strPerNumber)
+				strErrorMsg.AppendLine("Supervisor ID: " & strSupPerNumber)
+				strErrorMsg.AppendLine(ex.Message())
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_Person_Import_Supervisor " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		End If
+	Next     
+	
+	' 15/09/2022 - BP - Clear supervisor of anyone who has no record in the feed
+	Dim intClearedSups As Integer = 0 
+	Dim dbPersonSubs As IColDbObject = Connection.CreateCol("Person")
+	dbPersonSubs.Prototype.PutValue("ImportSource", importSource)
+	dbPersonSubs.Prototype.WhereClause = "UID_PersonHead IS NOT NULL"
+	dbPersonSubs.Prototype("PersonnelNumber").IsDisplayItem = True
+	dbPersonSubs.Prototype("UID_PersonHead").IsDisplayItem = True
+	dbPersonSubs.Load()
+	For Each person In dbPersonSubs
+		Dim personNumber As String = person.GetValue("PersonnelNumber").ToString()
+		CCC_NLog_WriteLog(loggerName, "Debug", "Checking Existing Manager Person.PersonnelNumer = '" & personNumber & "'")
+		
+		' Clear Manager If There Was no entry
+		If Not xmlPersonIDs.Contains(personNumber) Then
+			Try
+				Dim singleObjSubs As ISingleDbObject = person.Create()
+				singleObjSubs.PutValue("UID_PersonHead", "")
+				singleObjSubs.Save()
+				intClearedSups = intClearedSups + 1
+			Catch  ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error clearing person's supervisor.")
+				strErrorMsg.AppendLine("Person ID: " & personNumber)
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_Person_Import_Supervisor " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		End If
+		
+	Next
+		
+		
+	
+	' return some stats
+	Dim strWrite As StringBuilder = New StringBuilder
+	strWrite.AppendLine("AURION HR - Person Supervisor Import Script")
+	strWrite.AppendLine("Total person supervisors updated: " & intUpdatedSups)
+	strWrite.AppendLine("Total person supervisors removed: " & intRemovedSups)
+	strWrite.AppendLine("Total person supervisors cleared: " & intClearedSups)
+	RaiseMessage(MsgSeverity.Info, "AURION - CCC_Person_Import_Supervisor " & vbCrLf & strWrite.ToString())
+	CCC_NLog_WriteLog(loggerName, "Debug", "AURION - CCC_Person_Import_Supervisor " & vbCrLf & strWrite.ToString())
+	CCC_NLog_WriteLog(loggerName, "Debug", "Exiting CCC_Person_Import_Supervisor()")
+	Return strWrite.ToString()
+End Function
+
+' Generate Filter Query For Supervisor
+' 29/06/2022 - Brian Pack
+Public Function CCC_Person_Import_Supervisor_Filter(loggerName As String, ByVal importSource As String) As String
+	Dim configBase As String = CCC_Aurion_GetConfigBase(importSource)
+
+	' ***** 16/06/2022 - Brian Pack- Implement Filter Query
+	CCC_NLog_WriteLog(loggerName, "Debug", "Supervisor Query: Build Sorted List of Personnel Numbers (PersonnelNumber)")
+	Dim dbPersonEnum As List(Of String) = New List(Of String)
+	Dim dbPersonCol As IColDbObject = Connection.CreateCol("Person")
+	dbPersonCol.Prototype("UID_Person").IsDisplayItem = True
+	dbPersonCol.Prototype("PersonnelNumber").IsDisplayItem = True
+	dbPersonCol.Prototype.WhereClause = "isnull(PersonnelNumber, '') <> '' AND IsInActive = 'False' AND ImportSource = '" & importSource & "'"
+	dbPersonCol.Load()
+	
+	Dim trimPrefix As Char() = New Char() {}
+	trimPrefix = Connection.GetConfigParm(configBase & "\PersonnelNumberPrefix").ToString().ToCharArray()
+	
+	For Each dbPerson In dbPersonCol
+		dbPersonEnum.Add(dbPerson.GetEntity.GetValue("PersonnelNumber").ToString().TrimStart(trimPrefix))
+	Next
+	If dbPersonEnum.Count = 0 Then
+		dbPersonEnum.Add("0")
+	End If
+	' Add Largest Possible Employee Number to capture new employees 
+	dbPersonEnum.Add(Connection.GetConfigParm(configBase & "\QueryFilterFields\Supervisor_PersonnelNumber\Maximum").ToString())
+	dbPersonEnum.Sort(StringComparer.Ordinal)
+	
+	Dim filterPattern As String = Connection.GetConfigParm(configBase & "\QueryFilterFields\Supervisor_PersonnelNumber") & "={0}|" & Connection.GetConfigParm(configBase & "\QueryFilterFields\Supervisor_PersonnelNumber") & "={1}"
+	Dim blockSize As Int32 = 2000
+	Int32.TryParse(Connection.GetConfigParm(configBase & "\QueryFilterFields\BlockSize"), blockSize)
+
+	' Build Query blocks for IAM_SUPERVISOR report XML from Aurion
+	Dim filter As String = String.Empty
+	Dim minVal As String = ""
+	Dim maxVal As String = ""
+	
+	' Calaculate Filter Queries
+	Dim index As Int32 = 0
+	While (True)
+		If index < dbPersonEnum.count - 1 Then
+			minVal = dbPersonEnum(index)
+			
+			If (index + blockSize >= dbPersonEnum.count) Then
+				index = dbPersonEnum.count - 1
+			Else
+				index = index + blockSize
+			End If
+			maxVal = dbPersonEnum(index - 1)
+			filter = String.Format("{2}#" & filterPattern, minVal, maxVal, filter)		
+			Continue While
+		Else
+			Exit While
+		End If	
+	End While
+
+	CCC_NLog_WriteLog(loggerName, "Debug", "Supervisor Query: Filter Calculation:" & filter)
+	' ***** 16/06/2022 - Brian Pack - Filter Calculation Complete
+
+	Return filter
+	
+End Function
+	
+''' <summary>
+''' Import of Termination Schedule from Aurion via Schedule
+''' </summary>
+''' <returns>String result message</returns>
+''' 
+Public Function CCC_Person_Import_TerSchedule(Optional ByVal importSource As String = "AUR") As String
+	Dim configBase As String = CCC_Aurion_GetConfigBase(importSource)
+	Dim loggerName As String = CCC_Aurion_GetLoggerPrefix(importSource) & "_TERMINATION"
+	CCC_NLog_WriteLog(loggerName, "Debug", "Entering CCC_Person_Import_TerSchedule()")
+	'
+	' This script will sync the Employment records from Aurion HR to the Person table in OneIM
+	'
+	' vars
+	Dim strRtnValue As String = String.Empty
+	Dim intNewObjs As Integer = 0
+	Dim intUpdatedObjs As Integer = 0
+	Dim intDeletedObjs As Integer = 0
+	Dim strXMLDoc As String = String.Empty
+	Dim xmlDoc As Xml.XmlDocument = New Xml.XmlDocument
+	' Initiate Web Service
+	Dim QUERY_ID As String = Connection.GetConfigParm(configBase & "\QueryFilterFields\QueryIDs\Terminations").ToString()
+	Dim P_TOKEN As String = CCC_Aurion_LOGON(importSource)
+	' Perform Termination Single-Query to XML Document
+	strXMLDoc = CCC_Aurion_QUERY_TO_XML(loggerName, P_TOKEN, QUERY_ID, String.Empty, importSource)
+	' Disconnect Web Service
+	CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN, importSource)")
+	CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+	' Check if Aurion has returned 0 records - this is a valid result for Termination Schedules
+	If strXMLDoc = Connection.GetConfigParm(configBase & "\NoRecordsOutput") Then
+		Dim dbPers As IColDbObject = Connection.CreateCol("Person")
+		dbPers.Prototype.PutValue("ImportSource", importSource)
+		dbPers.Prototype.WhereClause = "CCC_TermTransNumber IS NOT NULL"
+		CCC_NLog_WriteLog(loggerName, "Debug", "Load Person.CCC_TermTransNumber IS NOT NULL")
+		dbPers.Load()
+		For Each dbPerson In dbPers
+			Dim singleObj As ISingleDbObject = dbPerson.Create()
+			singleObj.PutValue("CCC_TermTransNumber", "")
+			CCC_NLog_WriteLog(loggerName, "Debug", "Clearing Person.CCC_HireTransNumber")
+			singleObj.Save()
+			intDeletedObjs = intDeletedObjs + 1
+		Next
+		Dim strOutput As StringBuilder = New StringBuilder
+		strOutput.AppendLine("No XML produced. 0 Scheduled 'Termination Schedule' records in Aurion. Process Ended")
+		If intDeletedObjs > 0 Then
+			strOutput.AppendLine("Total person transaction numbers cleared: " & intDeletedObjs)
+		End If
+		strRtnValue = strOutput.ToString()
+		RaiseMessage(MsgSeverity.Info, "AURION - CCC_Person_Import_TerSchedule " & vbCrLf & strOutput.ToString())
+		CCC_NLog_WriteLog(loggerName, "Debug", "Exiting CCC_Person_Import_TerSchedule()")
+		Return strRtnValue
+	End If
+	' Load XML output from Aurion
+	Try
+		xmlDoc.LoadXml(strXMLDoc)
+	Catch ex As Exception
+		Dim strErrorMsg As StringBuilder = New StringBuilder
+		strErrorMsg.AppendLine("Error loading XML.")
+		strErrorMsg.AppendLine(ex.Message())
+		' Disconnect Web Service
+		CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN, importSource)")
+		CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+		' Throw error
+		CCC_NLog_WriteLog(loggerName, "Fatal", strErrorMsg.ToString())
+		Throw New AdHocDataException("Error loading XML. " & strErrorMsg.ToString())
+	End Try
+	' Main processing
+	RaiseMessage(MsgSeverity.Info, "AURION - CCC_Person_Import_TerSchedule - Starting snychronisation")
+	' SYNC WITH ONEIM OBJECTS
+	' load persons from DB
+	Dim dbPersons As IColDbObject = Connection.CreateCol("Person")
+	dbPersons.Prototype.PutValue("ImportSource", importSource)
+	dbPersons.Prototype("PersonnelNumber").IsDisplayItem = True
+	dbPersons.Prototype("CCC_EmployeeNumber").IsDisplayItem = True
+	dbPersons.Prototype("CCC_TermTransNumber").IsDisplayItem = True
+	CCC_NLog_WriteLog(loggerName, "Debug", "Load Person")
+	dbPersons.Load()
+	Dim dbPersonIDs As ArrayList = New ArrayList
+	Dim dbTermPersonIDs As ArrayList = New ArrayList
+	Dim xmlPersonIDs As ArrayList = New ArrayList
+	For Each dbPerson In dbPersons
+		dbPersonIDs.Add(dbPerson.GetValue("PersonnelNumber").ToString())
+		If Not String.IsNullOrWhiteSpace(dbPerson.GetValue("CCC_TermTransNumber").ToString()) Then
+			dbTermPersonIDs.Add(dbPerson.GetValue("PersonnelNumber").ToString())
+		End If
+	Next
+	' compare with org units in xml doc
+	CCC_NLog_WriteLog(loggerName, "Debug", "Loop through XML")
+	For Each node As System.Xml.XmlElement In xmlDoc.DocumentElement
+		Dim strPerNumber As String = node.Item("Person_Number").InnerText
+		Dim strDtEffective As String = node.Item("Date_Effective").InnerText
+		Dim strTransNumber As String = node.Item("Transaction_Number").InnerText
+		
+		Dim personNumberPrefix As String = Connection.GetConfigParm(configBase & "\PersonnelNumberPrefix").ToString()
+		strPerNumber = personNumberPrefix & strPerNumber
+		
+		xmlPersonIDs.Add(strPerNumber)
+		If dbPersonIDs.Contains(strPerNumber) Then
+			Try
+				' person exists in OneIM. Update attributes if needed
+				dbPersons.Clear()
+				dbPersons.Prototype.WhereClause = "PersonnelNumber = '" & strPerNumber & "' AND ImportSource = '" & importSource & "'"
+				CCC_NLog_WriteLog(loggerName, "Debug", "Load existing Person.PersonnelNumer = '" & strPerNumber & "'")
+				dbPersons.Load()
+				Dim singleObj As ISingleDbObject = dbPersons(0).Create()
+				Dim dtExitDate As DateTime = DateTime.ParseExact(strDtEffective, "dd/MM/yyyy", System.Globalization.DateTimeFormatInfo.InvariantInfo).AddDays(1)
+				' 27/07/2022 - Brian Pack - Add an override option for exit date
+				singleObj.PutValue("CCC_ExitDate", DbVal.MinDate)
+				singleObj.PutValue("ExitDate", dtExitDate)
+				singleObj.PutValue("CCC_TermTransNumber", strTransNumber)
+				If singleObj.IsChanged() = True Then
+					CCC_NLog_WriteLog(loggerName, "Debug", "Updating Person")
+					singleObj.Save()
+					intUpdatedObjs = intUpdatedObjs + 1
+				End If
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error updating person attributes.")
+				strErrorMsg.AppendLine("Person ID: " & strPerNumber)
+				strErrorMsg.AppendLine(ex.Message())
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_Person_Import_TerSchedule " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		End If
+	Next
+	' handle those which only exist in OneIM
+	Dim dbOnlyIDs As ArrayList = New ArrayList
+	For Each dbID In dbTermPersonIDs
+		If Not (xmlPersonIDs.Contains(dbID)) Then
+			dbOnlyIDs.Add(dbID)
+		End If
+	Next
+	If dbOnlyIDs.Count() > 0 Then
+		' items in DB which do not exist in Aurion XML feed
+		CCC_NLog_WriteLog(loggerName, "Debug", "Loop through missing Aurion Users")
+		For Each dbObjID As String In dbOnlyIDs
+			Try
+				dbPersons.Clear()
+				dbPersons.Prototype.WhereClause = "PersonnelNumber = '" & dbObjID & "' AND ImportSource = '" & importSource & "'"
+				dbPersons.Load()
+				Dim singleObj As ISingleDbObject = dbPersons(0).Create()
+				' 27/07/2022 - Brian Pack - Add an override option for exit date
+				singleObj.PutValue("CCC_ExitDate", DbVal.MinDate)
+				singleObj.PutValue("ExitDate", "")
+				singleObj.PutValue("CCC_TermTransNumber", "")
+				CCC_NLog_WriteLog(loggerName, "Debug", "Clearing Person.ExitDate and Person.CCC_HireTransNumber")
+				singleObj.Save()
+				intDeletedObjs = intDeletedObjs + 1
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error resetting person termination date.")
+				strErrorMsg.AppendLine("Person ID: " & dbObjID)
+				strErrorMsg.AppendLine(ex.Message())
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_Person_Import_TerSchedule " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		Next
+	End If
+	' return some stats
+	Dim strWrite As StringBuilder = New StringBuilder
+	strWrite.AppendLine("AURION HR - Person Termination Schedule Import Script")
+	strWrite.AppendLine("Total persons to be terminated: " & intUpdatedObjs)
+	strWrite.AppendLine("Total persons termination cleared: " & intDeletedObjs)
+	strRtnValue = strWrite.ToString()
+	RaiseMessage(MsgSeverity.Info, "AURION - CCC_Person_Import_TerSchedule " & vbCrLf & strWrite.ToString())
+	CCC_NLog_WriteLog(loggerName, "Debug", "Exiting CCC_Person_Import_TerSchedule()")
+	Return strRtnValue
+End Function
+
+''' <summary>
+''' Import of Positions from Aurion via Schedule
+''' </summary>
+''' <returns>String result message</returns>
+''' 
+Public Function CCC_Position_Import(Optional ByVal importSource As String = "AUR") As String
+	Dim configBase As String = CCC_Aurion_GetConfigBase(importSource)
+	Dim loggerName As String = CCC_Aurion_GetLoggerPrefix(importSource) & "_POSITION"
+	
+	Dim splitQueryEnabled As String = Connection.GetConfigParm(configBase & "\QueryFilterFields\Position_EnableSplitQuery").ToString()
+	
+	CCC_NLog_WriteLog(loggerName, "Debug", "Entering CCC_Position_Import()")
+	CCC_NLog_WriteLog(loggerName, "Debug", "ImportSource: " & importSource)
+	'
+	' This script will sync the Positions records from Aurion HR to the Department table in OneIM
+	'
+	' vars
+	Dim strRtnValue As String = String.Empty
+	Dim intNewObjs As Integer = 0
+	Dim intUpdatedObjs As Integer = 0
+	Dim intDeletedObjs As Integer = 0
+	Dim strXMLDoc As String = String.Empty
+	Dim xmlDoc As Xml.XmlDocument = New Xml.XmlDocument
+	Dim strUIDOrgRoot As String = Connection.GetSingleProperty("OrgRoot", "UID_OrgRoot", "Ident_OrgRoot = 'Positions'")
+	' Initiate Web Service
+	Dim QUERY_ID As String = Connection.GetConfigParm(configBase & "\QueryFilterFields\QueryIDs\Positions").ToString()
+	
+	Dim P_TOKEN As String = CCC_Aurion_LOGON(importSource)
+	Dim xmlElPrevious As System.Xml.XmlElement = Nothing 'Use for checking if we've moved to a new position number
+	Dim listXmlElMultiple As New List(Of System.Xml.XmlElement)() 'Accumulate elements for multiple cost centres here
+	' Perform Supervisor Single-Query to XML Document
+	
+	If splitQueryEnabled.Equals("True", StringComparison.InvariantCultureIgnoreCase) Then
+		Dim filter As String = CCC_Position_Import_Filter(strUIDOrgRoot, loggerName, importSource)
+		strXMLDoc = CCC_Aurion_QUERY_TO_XML(loggerName, P_TOKEN, QUERY_ID, filter, importSource)
+	Else
+		strXMLDoc = CCC_Aurion_QUERY_TO_XML(loggerName, P_TOKEN, QUERY_ID, String.Empty, importSource)
+	End If
+	
+	Try
+		xmlDoc.LoadXml(strXMLDoc)
+	Catch ex As Exception
+		Dim strErrorMsg As StringBuilder = New StringBuilder
+		strErrorMsg.AppendLine("Error loading XML.")
+		strErrorMsg.AppendLine(ex.Message())
+		' Disconnect Web Service
+		CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN, importSource)")
+		CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+		' Throw error
+		CCC_NLog_WriteLog(loggerName, "Fatal", strErrorMsg.ToString())
+		Throw New AdHocDataException("Error loading XML. " & strErrorMsg.ToString())
+	End Try
+	' Disconnect Web Service
+	CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN, importSource)")
+	CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+	' Main processing
+	RaiseMessage(MsgSeverity.Info, "AURION - CCC_Position_Import - Starting snychronisation")
+	' SYNC WITH ONEIM OBJECTS
+	' load positions from DB
+
+	'Dim dbOrgs As IColDbObject = Connection.CreateCol("Org")
+	'dbOrgs.Prototype.PutValue("ImportSource", importSource)
+	'dbOrgs.Prototype.PutValue("UID_OrgRoot", strUIDOrgRoot)
+	'dbOrgs.Prototype("Ident_Org").IsDisplayItem = True
+	'dbOrgs.Prototype("InternalName").IsDisplayItem = True
+	'dbOrgs.Prototype("UID_ParentOrg").IsDisplayItem = True
+	'dbOrgs.Prototype("UID_Department").IsDisplayItem = True
+	'dbOrgs.Prototype("UID_Locality").IsDisplayItem = True
+	'dbOrgs.Prototype("CustomProperty01").IsDisplayItem = True
+	'dbOrgs.Prototype("CustomProperty02").IsDisplayItem = True
+	'dbOrgs.Prototype("CustomProperty03").IsDisplayItem = True
+	'dbOrgs.Prototype("CustomProperty04").IsDisplayItem = True
+	'dbOrgs.Prototype("CustomProperty09").IsDisplayItem = True
+	'dbOrgs.Prototype("CustomProperty10").IsDisplayItem = True
+	CCC_NLog_WriteLog(loggerName, "Debug", "Load Org")
+	'dbOrgs.Load()
+	
+	Dim f As ISqlFormatter = Session.SqlFormatter
+		' Pull Locality info
+	Dim qLocalitys = Query.From("Locality").Where(f.Comparison("ImportSource", importSource, ValType.String, CompareOperator.Equal)).Select("UID_Locality", "Ident_Locality")
+	Dim dbLocalitys As IEntityCollection = Session.Source.GetCollection(qLocalitys, EntityCollectionLoadType.Slim)
+	Dim dbLocalityDict As New Dictionary(Of String, String)
+	For Each dbLocality As IEntity In dbLocalitys
+		dbLocalityDict(dbLocality.GetValue("Ident_Locality").ToString()) = dbLocality.GetValue("UID_Locality").ToString()
+	Next
+	CCC_NLog_WriteLog(loggerName, "Debug", "Current Locality Count in DB: " & dbLocalityDict.Count)
+	dbLocalitys = Nothing ' no further user, reclaim RAM
+	
+	' Pull Department info
+	Dim qDepartments = Query.From("Department").Where(f.Comparison("ImportSource", importSource, ValType.String, CompareOperator.Equal)).Select("UID_Department", "ObjectID", "FullPath")
+	Dim dbDepartments As IEntityCollection = Session.Source.GetCollection(qDepartments, EntityCollectionLoadType.Slim)
+	Dim dbDepartmentUidDict As New Dictionary(Of String, String)
+	Dim dbDepartmentFullPathDict As New Dictionary(Of String, String)
+	For Each dbDepartment As IEntity In dbDepartments
+		Dim departmentObjectId As String = dbDepartment.GetValue("ObjectID").ToString()
+		dbDepartmentUidDict(departmentObjectId) = dbDepartment.GetValue("UID_Department").ToString()
+		dbDepartmentFullPathDict(departmentObjectId) = dbDepartment.GetValue("FullPath").ToString()
+	Next
+	CCC_NLog_WriteLog(loggerName, "Debug", "Current Department Count in DB: " & dbDepartmentUidDict.Count)
+	dbDepartments = Nothing ' no further user, reclaim RAM
+
+	' Pull Position info
+	Dim qOrg = Query.From("Org") _
+		.Where(f.AndRelation(f.Comparison("UID_OrgRoot", strUIDOrgRoot, ValType.String, CompareOperator.Equal), f.Comparison("ImportSource", importSource, ValType.String, CompareOperator.Equal))) _
+		.Select("ImportSource", "UID_OrgRoot", "Ident_Org", "InternalName", _
+			"UID_ParentOrg", "UID_Department", "UID_Locality", "CustomProperty01", _
+			"CustomProperty02", "CustomProperty03", "CustomProperty04", "CustomProperty09", _
+			"CustomProperty10", "Remarks")
+	Dim dbOrgs As IEntityCollection = Session.Source.GetCollection(qOrg, EntityCollectionLoadType.Bulk)
+	Dim dbOrgIDs As HashSet(Of String) = New HashSet(Of String)
+	Dim xmlOrgIDs As HashSet(Of String) = New HashSet(Of String)
+	Dim dbOrgDict As New Dictionary(Of String, IEntity)
+	For Each dbOrg As IEntity In dbOrgs
+		Dim identOrg As String = dbOrg.GetValue("Ident_Org").ToString()
+		dbOrgIDs.Add(identOrg)
+		dbOrgDict(identOrg) = dbOrg
+	Next
+	CCC_NLog_WriteLog(loggerName, "Debug", "Current Position Count in DB: " & dbOrgIDs.Count)
+	
+	' compare with org units in xml doc
+	CCC_NLog_WriteLog(loggerName, "Debug", "Loop through XML")
+	Dim retryCount As Integer = 0
+	For Each node As System.Xml.XmlElement In xmlDoc.DocumentElement
+		Dim strTitle As String = node.Item("Position_Full_Title").InnerText
+		Dim strNumber As String = node.Item("Position_Number").InnerText
+		Dim strStatus As String = node.Item("Position_Status").InnerText
+		Dim strLocation As String = node.Item("Location_Code").InnerText
+		Dim strParentNumber As String = node.Item("Reports_to_Position").InnerText
+		Dim strClassification As String = node.Item("Classification").InnerText
+		Dim strOrgUnit As String = node.Item("Organisation_Unit_Number").InnerText 
+		
+		Dim personNumberPrefix As String = Connection.GetConfigParm(configBase & "\PersonnelNumberPrefix").ToString()
+		strNumber = personNumberPrefix & strNumber
+		strParentNumber = personNumberPrefix & strParentNumber
+		strLocation = personNumberPrefix & strLocation
+		strOrgUnit = personNumberPrefix & strOrgUnit
+		
+		'detect multiple positions
+		Dim strPreviousNumber As String = If(xmlElPrevious IsNot Nothing, xmlElPrevious.Item("Position_Number").InnerText, "")
+		If (strNumber.Equals(strPreviousNumber, StringComparison.CurrentCultureIgnoreCase) OrElse xmlElPrevious Is Nothing) Then 'Split cost centres, do not update position at this time
+			listXmlElMultiple.Add(node)
+		Else
+			'we have moved to the next position number so the list has finished building. Calculate cost center to use and apply to position object
+			Dim xmlChosenCostCentre As XmlElement
+			If (listXmlElMultiple.Count > 1) Then
+				xmlChosenCostCentre = listXmlElMultiple _
+					.OrderByDescending(Function(el) Decimal.Parse(el.Item("Percentage_Value").InnerText)) _
+					.First()
+			Else If (listXmlElMultiple.Count = 1) Then
+				xmlChosenCostCentre = listXmlElMultiple.First()
+			Else ' This should not happen, something has gone wrong
+				Dim strErrorMsg As String = $"List for previous multiple positions is empty, current position is {strNumber}"
+				CCC_NLog_WriteLog(loggerName, "Debug", strErrorMsg)
+				RaiseMessage(MsgSeverity.Serious, $"AURION - CCC_Position_Import: " & strErrorMsg)
+				Throw New AdHocDataException("Error parsing previous position data. " & strErrorMsg)
+			End If
+			'dbOrgs.Clear()
+			'dbOrgs.Prototype.WhereClause = $"Ident_Org = '{strPreviousNumber}' AND ImportSource = '{importSource}'"
+			CCC_NLog_WriteLog(loggerName, "Debug", $"Load previous object: Org.Ident_Org = '{strPreviousNumber}'")
+			
+			'dbOrgs.Load()
+			'Dim previousPosition As ISingleDbObject = dbOrgs.First().Create()
+			retryCount = 0
+			RetryCosting:
+			Try
+				Dim previousPosition As IEntity = If(retryCount = 0, dbOrgDict(strPreviousNumber), Session.Source.Get("Org", dbOrgDict(strPreviousNumber).GetValue("UID_Org").ToString()))
+				' Ensure that if this entity was modified/saved previously that we reload it here
+				If previousPosition.IsReadOnly Then
+					previousPosition = Session.Source.Get("Org", previousPosition.GetValue("UID_Org").ToString())
+				End If
+				Dim strCustomProperty01 As String = xmlChosenCostCentre.Item("Costing_Code_1").InnerText
+				Dim strCustomProperty02 As String = xmlChosenCostCentre.Item("Costing_Code_2").InnerText
+				Dim strCustomProperty03 As String = xmlChosenCostCentre.Item("Costing_Code_3").InnerText
+				Dim strCustomProperty04 As String = xmlChosenCostCentre.Item("Costing_Code_4").InnerText
+				If (strCustomProperty01 <> previousPosition.GetValue("CustomProperty01").ToString) Then
+					previousPosition.PutValue("CustomProperty01", strCustomProperty01)
+				End If
+				If (strCustomProperty02 <> previousPosition.GetValue("CustomProperty02").ToString) Then
+					previousPosition.PutValue("CustomProperty02", strCustomProperty02)
+				End If
+				If (strCustomProperty03 <> previousPosition.GetValue("CustomProperty03").ToString) Then
+					previousPosition.PutValue("CustomProperty03", strCustomProperty03)
+				End If
+				If (strCustomProperty04 <> previousPosition.GetValue("CustomProperty04").ToString) Then
+					previousPosition.PutValue("CustomProperty04", strCustomProperty04)
+				End If
+				If previousPosition.IsChanged() = True Then
+					CCC_NLog_WriteLog(loggerName, "Debug", $"Updating Org {strPreviousNumber} with cost code information")
+					previousPosition.Save(Session)
+				End If
+			Catch ex As Exception ' possible concurrency issue - object has changed since bulk load from DB - try again with fresh object
+				If retryCount < 2 Then
+					retryCount += 1
+					CCC_NLog_WriteLog(loggerName, "Debug", $"Retry {retryCount} for cost centre update {strPreviousNumber}: {ex.Message}")
+					Thread.Sleep(100)
+					GoTo RetryCosting
+				Else
+					Throw
+				End If
+			End Try
+
+			' reset for next position and add current
+			listXmlElMultiple.Clear()
+			listXmlElMultiple.Add(node)
+		End If
+		xmlElPrevious = node
+		
+		' Do not process position data that we have already seen
+		If (xmlOrgIDs.Contains(strNumber)) Then
+			CCC_NLog_WriteLog(loggerName, "Debug", $"Already processed position data for {strNumber}, skipping to next element")
+			Continue For
+		End If
+
+		CCC_NLog_WriteLog(loggerName, "Debug", $"Processing position data in XML for {strNumber}")
+		xmlOrgIDs.Add(strNumber)
+		If dbOrgIDs.Contains(strNumber) Then
+			retryCount = 0
+			RetryUpdate:
+			Try
+				' org exists in OneIM. Update attributes if needed
+				'dbOrgs.Clear()
+				'dbOrgs.Prototype.WhereClause = "Ident_Org = '" & strNumber & "' AND ImportSource = '" & importSource & "'"
+				CCC_NLog_WriteLog(loggerName, "Debug", "Load existing Org.Ident_Org = '" & strNumber & "'")
+				'dbOrgs.Load()
+				'Dim singleObj As ISingleDbObject = dbOrgs(0).Create()
+				Dim singleObj As IEntity = If(retryCount = 0, dbOrgDict(strNumber), Session.Source.Get("Org", dbOrgDict(strNumber).GetValue("UID_Org").ToString()))
+				For Each nodeItem As System.Xml.XmlElement In node
+					' compare attribute values between XML doc and DB object
+					Select Case LCase(nodeItem.Name)
+						Case "position_status"
+							' check DB record for status (Report only scoped to Show Active Positions)
+							If (strStatus.ToUpperInvariant() = "ACTIVE") AndAlso ((singleObj.GetValue("CustomProperty09").ToString.ToUpperInvariant() <> "") OrElse (singleObj.GetValue("CustomProperty10").ToString.ToUpperInvariant() <> "")) Then
+								' XML shows active, position is inactive in DB. Set to active
+								singleObj.PutValue("CustomProperty09", "")
+								singleObj.PutValue("CustomProperty10", "")
+							End If
+						Case "position_full_title"
+							If (strTitle <> singleObj.GetValue("InternalName").ToString) Then
+								singleObj.PutValue("InternalName", strTitle)
+							End If
+						Case "classification"
+							If (strClassification <> singleObj.GetValue("Remarks").ToString) Then
+								singleObj.PutValue("Remarks", strClassification)
+							End If
+						Case "location_code"
+							'Dim strLocGUID As String = Connection.GetSingleProperty("Locality", "UID_Locality", "Ident_locality = '" & strLocation & "' AND ImportSource = '" & importSource & "'")
+							'If (strLocGUID.ToUpperInvariant() <> singleObj.GetValue("UID_Locality").ToString.ToUpperInvariant()) Then
+							'	If strLocGUID.Length() > 1 Then
+							'		singleObj.PutValue("UID_Locality", strLocGUID)
+							'	End If
+							'End If
+							Dim strLocGUID As String = dbLocalityDict.GetValueOrDefault(strLocation)
+							If (strLocGUID IsNot Nothing AndAlso strLocGUID.ToUpperInvariant() <> singleObj.GetValue("UID_Locality").ToString.ToUpperInvariant() AndAlso strLocGUID.Length() > 1) Then
+								singleObj.PutValue("UID_Locality", strLocGUID)
+							End If
+						Case "reports_to_position"
+							'Dim parentOrgGUID As String = Connection.GetSingleProperty("Org", "UID_Org", "Ident_Org = '" & strParentNumber & "' AND ImportSource = '" & importSource & "'").ToString()
+							'If (parentOrgGUID.ToUpperInvariant() <> singleObj.GetValue("UID_ParentOrg").ToString.ToUpperInvariant()) Then
+							'	' parent org has changed. Load new GUID, set to current dept object
+							'	If parentOrgGUID.Length() > 1 Then
+							'		singleObj.PutValue("UID_ParentOrg", parentOrgGUID)
+							'	Else 
+							'		singleObj.PutValue("UID_ParentOrg", Nothing)
+							'	End If
+							'End If
+							Dim parentOrg As IEntity = dbOrgDict.GetValueOrDefault(strParentNumber)
+							If parentOrg IsNot Nothing Then
+								Dim parentOrgGUID As String = parentOrg.GetValue("UID_Org").ToString
+								If (parentOrgGUID.ToUpperInvariant() <> singleObj.GetValue("UID_ParentOrg").ToString.ToUpperInvariant() AndAlso parentOrgGUID.Length() > 1) Then
+									singleObj.PutValue("UID_ParentOrg", parentOrgGUID)
+								End If
+							End If
+						Case "organisation_unit_number"
+							'Dim deptGUID As String = Connection.GetSingleProperty("Department", "UID_Department", "ObjectID = '" & strOrgUnit & "' AND ImportSource = '" & importSource & "'").ToString()
+							'If (deptGUID.ToUpperInvariant() <> singleObj.GetValue("UID_Department").ToString.ToUpperInvariant()) Then
+							'	' department has changed. set to new dept object
+							'	If deptGUID.Length() > 1 Then
+							'		singleObj.PutValue("UID_Department", deptGUID)
+							'	End If
+							'	
+							'	' Calculate Mail Changes for Person in Position
+							'	Dim fullpath As String = Connection.GetSingleProperty("Department", "FullPath", "UID_Department = '" & deptGUID & "' AND ImportSource = '" & importSource & "'").ToString()
+							'	CCC_Person_Name_Change_ByDepartment(deptGUID, fullpath)
+							'End If
+							Dim deptGUID As String = dbDepartmentUidDict.GetValueOrDefault(strOrgUnit)
+							If (deptGUID.ToUpperInvariant() <> singleObj.GetValue("UID_Department").ToString.ToUpperInvariant()) Then
+								' department has changed. set to new dept object
+								If deptGUID.Length() > 1 Then
+									singleObj.PutValue("UID_Department", deptGUID)
+								End If
+								
+								' 26/07/2025 - GG - CCC_Person_Name_Change_ByDepartment only operates on first person found in this position, needs updating if we go back to multi domain config
+								' Calculate Mail Changes for Person in Position
+								Dim fullPath As String = dbDepartmentFullPathDict.GetValueOrDefault(strOrgUnit)
+								If fullPath IsNot Nothing Then
+								 	CCC_Person_Name_Change_ByDepartment(deptGUID, fullPath)
+								End If
+							End If
+					End Select
+				Next
+				If singleObj.IsChanged() = True Then
+					' org's attribute values have changed. Save the record to the DB
+					'Stop
+					CCC_NLog_WriteLog(loggerName, "Debug", $"Updating Org {strNumber}")
+					singleObj.Save(Session)
+					intUpdatedObjs = intUpdatedObjs + 1
+				End If
+			Catch ex As Exception When ex.Message.Contains("Error saving")
+		 	    If retryCount < 2 Then
+					retryCount += 1
+					CCC_NLog_WriteLog(loggerName, "Debug", $"Retry {retryCount} for org update {strNumber}: {ex.Message}")
+					Thread.Sleep(100)
+					GoTo RetryUpdate
+				Else
+					Throw
+				End If
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error updating position attributes.")
+				strErrorMsg.AppendLine("Position ID: " & strNumber)
+				strErrorMsg.AppendLine(ex.Message())
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_Position_Import " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		Else
+			Try
+				' org not in OneIM. Create it
+				CCC_NLog_WriteLog(loggerName, "Debug", "New Org")
+				Dim newDbObject As IEntity = Session.Source.CreateNew("Org")
+				newDbObject.PutValue("ImportSource", importSource)
+				newDbObject.PutValue("UID_OrgRoot", strUIDOrgRoot)
+				'newDbObject.PutValue("CustomProperty01", "AUR") ' - debugging purposes
+				newDbObject.PutValue("Ident_Org", strNumber)
+				newDbObject.PutValue("InternalName", strTitle)
+				newDbObject.PutValue("Remarks", strClassification)
+				' Report only scope to Active positions, active check left in case filter is removed
+				If Not (strStatus.ToUpperInvariant() = "ACTIVE") Then
+					newDbObject.PutValue("CustomProperty09", "POSITION IS INACTIVE")
+				End If
+				If strParentNumber.Length() > 0 Then
+					'Dim parentGUID As String = Connection.GetSingleProperty("Org", "UID_Org", "Ident_Org = '" & strParentNumber & "' AND ImportSource = '" & importSource & "'")
+					'If parentGUID.Length() > 1 Then
+					'	newDbObject.PutValue("UID_ParentOrg", parentGUID)
+					'End If
+					Dim parentOrg As IEntity = dbOrgDict.GetValueOrDefault(strParentNumber)
+					If parentOrg IsNot Nothing Then
+						Dim parentOrgGUID As String = parentOrg.GetValue("UID_Org").ToString
+						If parentOrgGUID.Length() > 1 Then
+							newDbObject.PutValue("UID_ParentOrg", parentOrgGUID)
+						End If
+					End If
+				End If
+				If strLocation.Length() > 0 Then
+					Dim locGUID As String = dbLocalityDict.GetValueOrDefault(strLocation) 'Connection.GetSingleProperty("Locality", "UID_Locality", "Ident_Locality = '" & strLocation & "' AND ImportSource = '" & importSource & "'")
+					If locGUID.Length() > 1 Then
+						newDbObject.PutValue("UID_Locality", locGUID)
+					End If
+				End If
+				If strOrgUnit.Length() > 0 Then
+					Dim deptGUID As String = dbDepartmentUidDict.GetValueOrDefault(strOrgUnit)'Connection.GetSingleProperty("Department", "UID_Department", "ObjectID = '" & strOrgUnit & "' AND ImportSource = '" & importSource & "'")
+					If deptGUID.Length() > 1 Then
+						newDbObject.PutValue("UID_Department", deptGUID)
+					End If
+				End If
+				CCC_NLog_WriteLog(loggerName, "Debug", "Creating Org")
+				Using uow As IUnitOfWork = Session.StartUnitOfWork()
+					uow.Put(newDbObject)
+					uow.Commit()
+				End Using
+				' Load the object back out of DB to add to dict
+				dbOrgDict(strNumber) = Session.Source.Get("Org", newDbObject.GetValue("UID_Org").ToString())
+				'newDbObject.Save()
+				intNewObjs = intNewObjs + 1
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error creating a new position.")
+				strErrorMsg.AppendLine("Position ID: " & strNumber)
+				strErrorMsg.AppendLine(ex.Message())
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_Position_Import " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		End If
+		CCC_NLog_WriteLog(loggerName, "Debug", $"Finished processing position data in XML for {strNumber}")
+	Next
+	CCC_NLog_WriteLog(loggerName, "Debug", "Looping through XML complete, checking for entries in DB that are missing from query result")
+	' handle those which only exist in OneIM
+	Dim dbOnlyIDs As ArrayList = New ArrayList
+	For Each dbID In dbOrgIDs
+		If Not (xmlOrgIDs.Contains(dbID)) Then
+			dbOnlyIDs.Add(dbID)
+		End If
+	Next
+	CCC_NLog_WriteLog(loggerName, "Debug", $"Finished missing entry comparison, found {dbOnlyIDs.Count} entries in DB not present in XML")
+	If dbOnlyIDs.Count > 0 Then
+		' items in DB which do not exist in Aurion XML feed
+		For Each dbObjID As String In dbOnlyIDs
+			retryCount = 0
+			RetryDeactivate:
+			Try
+				'dbOrgs.Clear()
+				'dbOrgs.Prototype.WhereClause = "Ident_Org = '" & dbObjID & "' AND ImportSource = '" & importSource & "'"
+				'dbOrgs.Load()
+				'Dim singleObj As ISingleDbObject = dbOrgs(0).Create()
+				Dim singleObj As IEntity = dbOrgDict(dbObjID)
+				If singleObj.GetValue("CustomProperty10").ToString.ToUpperInvariant() <> "DOES_NOT_EXIST" Then
+					singleObj.PutValue("CustomProperty10", "DOES_NOT_EXIST")
+					CCC_NLog_WriteLog(loggerName, "Debug", $"Deactivating Org {dbObjID}")
+					singleObj.Save(Session)
+					intDeletedObjs = intDeletedObjs + 1
+				End If
+			Catch ex As Exception When ex.Message.Contains("Error saving")
+		 	    If retryCount < 2 Then
+					retryCount += 1
+					CCC_NLog_WriteLog(loggerName, "Debug", $"Retry {retryCount} for org deactivation {dbObjID}: {ex.Message}")
+					Thread.Sleep(100)
+					GoTo RetryDeactivate
+				Else
+					Throw
+				End If
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error deactivating a position.")
+				strErrorMsg.AppendLine("Position ID: " & dbObjID)
+				strErrorMsg.AppendLine(ex.Message())
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_Position_Import " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		Next
+	End If
+	' return some stats
+	Dim strWrite As StringBuilder = New StringBuilder
+	strWrite.AppendLine("AURION HR - Position Import Script")
+	strWrite.AppendLine("Total positions created: " & intNewObjs)
+	strWrite.AppendLine("Total positions updated: " & intUpdatedObjs)
+	strWrite.AppendLine("Total positions deactivated: " & intDeletedObjs)
+	strRtnValue = strWrite.ToString()
+	RaiseMessage(MsgSeverity.Info, "AURION - CCC_Position_Import " & vbCrLf & strWrite.ToString())
+	CCC_NLog_WriteLog(loggerName, "Debug", "Exiting CCC_Position_Import()")
+	Return strRtnValue
+End Function
+
+' ***** 16/06/2022 - Brian Pack- Implement Filter Query
+Public Function CCC_Position_Import_Filter(strUIDOrgRoot As String, loggerName As String, ByVal importSource As String) As String
+	Dim configBase As String = CCC_Aurion_GetConfigBase(importSource)
+
+		' ***** 16/06/2022 - Brian Pack- Implement Filter Query
+	CCC_NLog_WriteLog(loggerName, "Debug", "Build Sorted List of Position Numbers (Position: Ident_Org)")
+	Dim dbOrgEnum As List(Of String) = New List(Of String)
+	Dim dbOrgCol As IColDbObject = Connection.CreateCol("Org")
+	dbOrgCol.Prototype("UID_Org").IsDisplayItem = True
+	dbOrgCol.Prototype("Ident_Org").IsDisplayItem = True
+	dbOrgCol.Prototype.WhereClause = "UID_ORGROOT = '" & strUIDOrgRoot & "'  AND ImportSource = '" & importSource & "'"
+	dbOrgCol.Load()
+	
+	Dim trimPrefix As Char() = New Char() {}
+	trimPrefix = Connection.GetConfigParm(configBase & "\PersonnelNumberPrefix").ToString().ToCharArray()
+	
+	For Each dbOrg In dbOrgCol
+		dbOrgEnum.Add(dbOrg.GetEntity.GetValue("Ident_Org").ToString().TrimStart(trimPrefix))
+	Next
+	' Add Largest Possible Employee Number to capture new employees 
+	dbOrgEnum.Add(Connection.GetConfigParm(configBase & "\QueryFilterFields\Position_PositionNumber\Maximum").ToString())
+	dbOrgEnum.Sort(StringComparer.Ordinal)
+	
+	Dim filterPattern As String = Connection.GetConfigParm(configBase & "\QueryFilterFields\Position_PositionNumber") & "={0}|" & Connection.GetConfigParm(configBase & "\QueryFilterFields\Position_PositionNumber") & "={1}"
+	Dim blockSize As Int32 = 2000
+	Int32.TryParse(Connection.GetConfigParm(configBase & "\QueryFilterFields\BlockSize"), blockSize)
+
+	' Build Query blocks for IAM_EMPLOYMENT report XML from Aurion
+	Dim filter As String = String.Empty
+	Dim minVal As String = ""
+	Dim maxVal As String = ""
+	
+	' Calaculate Filter Queries
+	Dim index As Int32 = 0
+	While (True)
+		If index < dbOrgEnum.count - 1 Then
+			minVal = dbOrgEnum(index)
+			
+			If (index + blockSize >= dbOrgEnum.count) Then
+				index = dbOrgEnum.count - 1
+			Else
+				index = index + blockSize
+			End If
+			maxVal = dbOrgEnum(index)
+			filter = String.Format("{2}#" & filterPattern, minVal, maxVal, filter)		
+			Continue While
+		Else
+			Exit While
+		End If	
+	End While
+
+	CCC_NLog_WriteLog(loggerName, "Debug", "Filter Calculation:" & filter)
+	' ***** 16/06/2022 - Brian Pack - Filter Calculation Complete
+	
+	Return filter
+End Function
+
+''' <summary>
+''' Import of Termination Record Date from Aurion via Schedule - KG - 2/14/2024
+''' </summary>
+''' <returns>String result message</returns>
+''' 
+Public Function CCC_TermRecord_Import(Optional ByVal importSource As String = "AUR") As String
+	Dim configBase As String = CCC_Aurion_GetConfigBase(importSource)
+	Dim loggerName As String = CCC_Aurion_GetLoggerPrefix(importSource) & "_TERMRECORD"
+	CCC_NLog_WriteLog(loggerName, "Debug", "Entering CCC_TermRecord_Import()")
+
+	
+	'
+	' This script will sync the Termination records from Aurion HR to the Person table in OneIM
+	'
+	' vars
+	Dim strRtnValue As String = String.Empty
+	Dim intNewObjs As Integer = 0
+	Dim intUpdatedObjs As Integer = 0
+	Dim intDeletedObjs As Integer = 0
+	Dim strXMLDoc As String = String.Empty
+	Dim xmlDoc As Xml.XmlDocument = New Xml.XmlDocument
+
+	' Initiate Web Service
+	Dim QUERY_ID As String = Connection.GetConfigParm(configBase & "\QueryFilterFields\QueryIDs\TermRecord").ToString()
+	Dim P_TOKEN As String = CCC_Aurion_LOGON(importSource)
+	
+	' Perform Termination Single-Query to XML Document
+	strXMLDoc = CCC_Aurion_QUERY_TO_XML(loggerName, P_TOKEN, QUERY_ID, String.Empty, importSource)
+	
+	' Load XML output from Aurion	
+	Try
+	xmlDoc.LoadXml(strXMLDoc)
+	Catch ex As Exception
+	Dim strErrorMsg As StringBuilder = New StringBuilder
+	strErrorMsg.AppendLine("Error loading XML.")
+	strErrorMsg.AppendLine(ex.Message())
+	' Disconnect Web Service
+	CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN, importSource)")
+	CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+	' Throw error
+	CCC_NLog_WriteLog(loggerName, "Fatal", strErrorMsg.ToString())
+	Throw New AdHocDataException("Error loading XML. " & strErrorMsg.ToString())
+	End Try
+	
+	' Disconnect Web Service
+	CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN, importSource)")
+	CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+	
+	' Main processing
+	RaiseMessage(MsgSeverity.Info, "AURION - CCC_TermRecord_Import - Starting snychronisation")
+	' SYNC WITH ONEIM OBJECTS
+	' load person objects from DB
+	Dim dbPersons As IColDbObject = Connection.CreateCol("Person")
+	dbPersons.Prototype.PutValue("ImportSource", importSource)
+	dbPersons.Prototype.WhereClause = "CCC_EmployeeNumber IS NOT NULL AND ImportSource = '" & importSource & "'"
+	dbPersons.Prototype("PersonnelNumber").IsDisplayItem = True
+	dbPersons.Prototype("CCC_EmployeeNumber").IsDisplayItem = True
+	CCC_NLog_WriteLog(loggerName, "Debug", "Load Person.CCC_EmployeeNumber IS NOT NULL")
+	dbPersons.Load()
+	Dim dbPersonIDs As ArrayList = New ArrayList
+	Dim dbTermPersonIDs As ArrayList = New ArrayList
+	Dim xmlPersonIDs As ArrayList = New ArrayList
+	For Each dbPerson In dbPersons
+		dbPersonIDs.Add(dbPerson.GetValue("PersonnelNumber").ToString())
+	Next
+	' compare with org units in xml doc
+	CCC_NLog_WriteLog(loggerName, "Debug", "Loop through XML")
+		
+	For Each node As System.Xml.XmlElement In xmlDoc.DocumentElement
+		Dim strPerNumber As String = node.Item("Person_Number").InnerText
+		Dim strEmpNumber As String = node.Item("Employee_Number").InnerText
+		Dim strTermDate As String = node.Item("Date_Terminated").InnerText
+		Dim strCreateDate As String = node.Item("Create_Date_Time_Stamp").InnerText
+		Dim strModifyDate As String = node.Item("Modify_Date_Time_Stamp").InnerText
+		
+		Dim personNumberPrefix As String = Connection.GetConfigParm(configBase & "\PersonnelNumberPrefix").ToString()
+		strPerNumber = personNumberPrefix & strPerNumber
+
+		xmlPersonIDs.Add(strPerNumber)
+		If dbPersonIDs.Contains(strPerNumber) Then
+			Try
+				' person exists in OneIM. Update attributes if needed
+				dbPersons.Clear()
+				dbPersons.Prototype.WhereClause = "PersonnelNumber = '" & strPerNumber & "' AND ImportSource = '" & importSource & "'"
+				CCC_NLog_WriteLog(loggerName, "Debug", "Load existing Person.PersonnelNumer = '" & strPerNumber & "'")
+				dbPersons.Load()
+				Dim singleObj As ISingleDbObject = dbPersons(0).Create()
+				For Each nodeItem As System.Xml.XmlElement In node
+					Select Case LCase(nodeItem.Name)
+						Case "create_date_time_stamp"
+							If 	strCreateDate <> "" Then
+								Dim dtCreateDate As DateTime = DateTime.ParseExact(strCreateDate, "dd/MM/yyyy", System.Globalization.DateTimeFormatInfo.InvariantInfo)
+								If (singleObj.GetValue("CCC_LastKnown_TermDate").Date = Nothing) Then
+									singleObj.PutValue("CCC_LastKnown_TermDate", dtCreateDate)
+								ElseIf (singleObj.GetValue("CCC_LastKnown_TermDate").Date  < dtCreateDate) Then
+									singleObj.PutValue("CCC_LastKnown_TermDate", dtCreateDate)
+								End If
+							End If
+						Case "modify_date_time_stamp"
+							If 	strModifyDate <> "" Then
+								Dim dtModifyDate As DateTime = DateTime.ParseExact(strModifyDate, "dd/MM/yyyy", System.Globalization.DateTimeFormatInfo.InvariantInfo)
+								If (singleObj.GetValue("CCC_LastKnown_TermDateUpdate").Date = Nothing) Then
+									singleObj.PutValue("CCC_LastKnown_TermDateUpdate", dtModifyDate)
+								ElseIf (singleObj.GetValue("CCC_LastKnown_TermDateUpdate").Date < dtModifyDate) Then
+									singleObj.PutValue("CCC_LastKnown_TermDateUpdate", dtModifyDate)
+								End If
+							End If	
+					End Select
+
+					If singleObj.IsChanged() = True Then
+						CCC_NLog_WriteLog(loggerName, "Debug", "Updating Person")
+						singleObj.Save()
+						intUpdatedObjs = intUpdatedObjs + 1
+					End If
+				Next
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error updating person attributes.")
+				strErrorMsg.AppendLine("Person ID: " & strPerNumber)
+				strErrorMsg.AppendLine(ex.Message())
+				CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+				RaiseMessage(MsgSeverity.Serious, "AURION - CCC_TermRecord_Import " & vbCrLf & strErrorMsg.ToString())
+			End Try
+		End If
+	Next
+		' return some stats
+	Dim strWrite As StringBuilder = New StringBuilder
+	strWrite.AppendLine("AURION HR - Person Termination Date Schedule Import Script")
+	strWrite.AppendLine("Total terminated date stamp created: " & intUpdatedObjs)
+	strWrite.AppendLine("Total termination date stamp cleared: " & intDeletedObjs)
+	strRtnValue = strWrite.ToString()
+	RaiseMessage(MsgSeverity.Info, "AURION - CCC_TermRecord_Import " & vbCrLf & strWrite.ToString())
+	CCC_NLog_WriteLog(loggerName, "Debug", "Exiting CCC_TermRecord_Import()")
+	Return strRtnValue	
+End Function
