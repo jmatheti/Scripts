@@ -1,0 +1,165 @@
+Public Function CCC_Test_PopulateUPN() As String
+
+	Dim fileStr As String = System.IO.File.ReadAllText("D:\IDM_Workspace\upns.txt")
+	Dim file As System.IO.StreamWriter = System.IO.File.AppendText("D:\IDM_Workspace\upns.txt")
+
+	Dim EnvPrefix As String = Session.Config.GetConfigParm("Custom\Environment\CentralAccountPrefix")
+
+	Dim personCol As IColDbObject = Connection.CreateCol("Person")
+	personCol.Prototype("uid_person").IsDisplayItem = True
+	personCol.Prototype("LastName").IsDisplayItem = True
+	personCol.Prototype("FirstName").IsDisplayItem = True
+	personCol.Prototype("centralaccount").IsDisplayItem = True
+	personCol.Prototype("customProperty08").IsDisplayItem = True
+	personCol.Prototype("PreferredName").IsDisplayItem = True
+	
+	personCol.Load()
+	
+	Dim counter As Int32 = 0
+	Dim ca As String = ""
+	
+	For Each person In personCol	
+		Dim uid_person As String = person.GetValue("uid_person").ToString()
+		Dim LastName As String = person.GetValue("LastName").ToString()
+		Dim FirstName As String = person.GetValue("FirstName").ToString()
+		Dim centralaccount As String = person.GetValue("centralaccount").ToString()
+		Dim customProperty08 As String = person.GetValue("customProperty08").ToString()
+		Dim PreferredName As String = person.GetValue("PreferredName").ToString()
+		centralaccount = centralaccount.Replace(EnvPrefix, "")
+				
+		If Not CCC_AE_BuildCentralAccount_isAccountFormatValid(centralaccount) And _
+				String.IsNullOrEmpty(customProperty08) And _
+				Not fileStr.Contains(uid_person) Then
+				
+			counter += 1
+			
+			Dim newCA As String
+			If String.IsNullOrEmpty(PreferredName) Then
+				newCA = CCC_TESTUPN_BuildCentralAccount(uid_person, LastName, FirstName)
+			Else
+				newCA = CCC_TESTUPN_BuildCentralAccount(uid_person, LastName, PreferredName)
+			End If
+			
+			Dim singleObj As ISingleDbObject = person.Create()
+
+			singleObj.PutValue("customProperty08", newCA)
+			singleObj.save()
+
+			
+			file.WriteLine(uid_person & "," & newCA)
+			ca &= newCA & ","
+		End If
+		
+		If counter >= 30 Then
+			'Exit For
+		End If
+	Next	
+	
+	file.Close()
+	Return "Updates: " & counter & " " & ca
+End Function
+
+Public Function CCC_TESTUPN_BuildCentralAccount(ByVal uid_person As String, ByVal LastName As String, ByVal FirstName As String) As String
+	Dim loggerName As String = "CENTRAL_ACCOUNT"
+
+	Dim f As ISqlFormatter = Connection.SqlFormatter
+	' Get column max length
+	'Dim fieldLength As Int32 = CCC_GetColumnMaxSize("Person.CentralAccount")
+	'Check for parameters
+	If String.IsNullOrEmpty(LastName) OrElse String.IsNullOrEmpty(FirstName) Then 
+
+		Return String.Empty
+	End If
+	Dim EnvPrefix As String = Session.Config.GetConfigParm("Custom\Environment\CentralAccountPrefix")
+	' username standard is <Initials of FirstName and LastName + 4 digits (starting at 0001, increasing by 1)>
+	' prefix added based on custom config parameter for Dev and Test environment. Resolves to null in Prod.
+	Dim accntPrefix As String = String.Empty
+	accntPrefix = FirstName.substring(0,1) & LastName.substring(0,1)
+	accntPrefix = VI_AE_FormatConvertUmlaut_Sonderzeichen(accntPrefix)
+	accntPrefix = EnvPrefix & accntPrefix
+	Dim accnt As String = String.Empty
+
+	' Find uniqueness
+'	Dim aadOrg As String = Connection.GetSingleProperty("EX0Organization", "UID_AADOrganizationOffPrem", f.Comparison("UID_AADOrganizationOffPrem", String.Empty, ValType.String, CompareOperator.NotEqual)).String
+	Dim i As Int32 = 1
+	accnt = accntPrefix & i.ToString("D4")
+
+'	12/07/2022 - BP - Temporarily Look at Custom Property 08 for pre allocated CentralAccount Names
+'	Do While (Connection.Exists("Person", _
+'			f.AndRelation( _
+'				f.Comparison("CentralAccount", accnt, ValType.String, CompareOperator.Equal, FormatterOptions.IgnoreCase), _
+'				f.UidComparison("UID_Person", uid_person, CompareOperator.NotEqual) _
+'			)) OrElse Connection.Exists("AADUser", _
+'			f.AndRelation( _
+'				f.UidComparison("UID_AADOrganization", aadOrg, CompareOperator.Equal), _
+'				f.Comparison("UserPrincipalName", accnt + "@%", ValType.String, CompareOperator.Like, FormatterOptions.IgnoreCase), _
+'				f.UidComparison("UID_Person", uid_person, CompareOperator.NotEqual) _
+'			)))
+	Do While (Connection.Exists("Person", _
+			f.AndRelation( _
+				f.Comparison("CentralAccount", accnt, ValType.String, CompareOperator.Equal, FormatterOptions.IgnoreCase), _
+				f.UidComparison("UID_Person", uid_person, CompareOperator.NotEqual) _
+			)) OrElse Connection.Exists("Person", _	
+			f.AndRelation( _
+				f.Comparison("CustomProperty08", accnt, ValType.String, CompareOperator.Equal, FormatterOptions.IgnoreCase), _
+				f.UidComparison("UID_Person", uid_person, CompareOperator.NotEqual) _
+			)))	
+		i = i + 1
+		If i > 9999 Then
+
+			Throw New ViException("Allocation exhausted for " & accntPrefix)
+		End If
+		accnt = accntPrefix & i.ToString("D4")
+	Loop
+	' Return value
+	Return accnt.ToUpperInvariant()
+End Function
+
+
+Public Function CCC_Test_DomainCalc() As String
+
+	Dim fileStr As String = System.IO.File.ReadAllText("D:\IDM_Workspace\domain.txt")
+	Dim file As System.IO.StreamWriter = System.IO.File.AppendText("D:\IDM_Workspace\domain.txt")
+
+	Dim EnvPrefix As String = Session.Config.GetConfigParm("Custom\Environment\CentralAccountPrefix")
+
+	Dim personCol As IColDbObject = Connection.CreateCol("Person")
+	personCol.Prototype("uid_person").IsDisplayItem = True
+	personCol.Prototype("LastName").IsDisplayItem = True
+	personCol.Prototype("FirstName").IsDisplayItem = True
+	personCol.Prototype("centralaccount").IsDisplayItem = True
+	personCol.Prototype("customProperty08").IsDisplayItem = True
+	personCol.Prototype("PreferredName").IsDisplayItem = True
+	personCol.Prototype("UID_org").IsDisplayItem = True
+	personCol.Prototype("CCC_Company").IsDisplayItem = True
+	personCol.Prototype("importsource").IsDisplayItem = True
+	
+	personCol.Load()
+	
+	Dim counter As Int32 = 0
+	Dim ca As String = ""
+	
+	For Each person In personCol	
+		Dim uid_person As String = person.GetValue("uid_person").ToString()
+		Dim LastName As String = person.GetValue("LastName").ToString()
+		Dim FirstName As String = person.GetValue("FirstName").ToString()
+		Dim centralaccount As String = person.GetValue("centralaccount").ToString()
+		Dim customProperty08 As String = person.GetValue("customProperty08").ToString()
+		Dim PreferredName As String = person.GetValue("PreferredName").ToString()
+		Dim uid_org As String = person.GetValue("uid_org").ToString()
+		Dim company As String = person.GetValue("CCC_Company").ToString()
+		Dim importSource As String = person.GetValue("ImportSource").ToString()
+		centralaccount = centralaccount.Replace(EnvPrefix, "")
+		
+		Dim org_FullPath As String = Connection.GetSingleProperty("Org", "FullPath", "UID_Org = '" & uid_org & "'")
+		
+		Dim domain As String = CCC_Person_Domain(company, org_FullPath, importSource)
+		
+		file.WriteLine(uid_person & "," & domain & "," & company & "," & org_FullPath)
+		
+		counter += 1
+	Next	
+	
+	file.Close()
+	Return "Updates: " & counter & " " & ca
+End Function
