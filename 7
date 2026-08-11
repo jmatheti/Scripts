@@ -1,0 +1,179 @@
+#If Not SCRIPTDEBUGGER Then
+	Imports System.Data
+	Imports System.Xml
+#End If
+
+''' <summary>
+''' 1 Param to 2 Param call
+''' </summary>
+''' <param name="dbsUnsAccount">SingleDbObjectSnapshot of UNSAccountB</param>
+''' <returns>API Response</returns>
+'''
+Function CCC_UNSAccountB_ESS_DCCEEW_Insert(ByVal dbsUnsAccount As SingleDbObjectSnapshot) As String
+	Return CCC_UNSAccountB_ESS_DCCEEW_Insert(dbsUnsAccount, String.Empty)
+End Function
+
+''' <summary>
+''' Insert ESS Account from UNSAccountB
+''' </summary>
+''' <param name="dbsUnsAccount">SingleDbObjectSnapshot of UNSAccountB</param>
+''' <param name="strXMLDoc">Xml.XmlDocument as String</param>
+''' <returns>API Response</returns>
+'''
+Function CCC_UNSAccountB_ESS_DCCEEW_Insert(ByVal dbsUnsAccount As SingleDbObjectSnapshot, Optional ByVal strXMLDoc As String = "") As String
+	Dim importSource = "AUR_DCCEEW"
+	Dim loggerName As String = "AURION_DCCEEW_USERS"
+	CCC_NLog_WriteLog(loggerName, "Debug", "Entering CCC_UNSAccountB_ESS_DCCEEW_Insert(dbsUnsAccount, strXMLDoc)")
+	' vars
+	Dim strRtnVal As String = String.Empty
+	Dim strAPIResponse As String = String.Empty
+	Dim xmlDoc As Xml.XmlDocument = New Xml.XmlDocument
+	Dim P_TOKEN As String = CCC_Aurion_LOGON(importSource)
+	' create new Aurion ESS user
+	Dim P_FUNCTION As String = "SEC_USER_ADD"
+	Dim P_DELIMITER As String = ","
+	Dim strAccStatus As String = String.Empty ' P-Active or I-Inactive
+	If dbsUnsAccount.GetValue("AccountDisabled").Bool = True Then
+		CCC_NLog_WriteLog(loggerName, "Trace", "UNSAccountB.AccountDisabled = True")
+		strAccStatus = "I"
+	Else
+		CCC_NLog_WriteLog(loggerName, "Trace", "UNSAccountB.AccountDisabled = False")
+		strAccStatus = "P"
+	End If
+	Dim strXObjectKey As String = dbsUnsAccount.GetValue("XObjectKey").ToString()
+	Dim strUserID As String = dbsUnsAccount.GetValue("cn").ToString()
+	Dim strOSUserID As String = dbsUnsAccount.GetValue("AccountName").ToString()
+	Dim strUserName As String = dbsUnsAccount.GetValue("DisplayName").ToString()
+	Dim strPersNumber As String = dbsUnsAccount.GetValue("CCC_PersonnelNumber").ToString()
+	Dim strEmailAddr As String = dbsUnsAccount.GetValue("CCC_EmailAddress").ToString()
+	Dim strPwd As String = dbsUnsAccount.GetValue("Password").ToString()
+	strPwd = VI.Base.Encryption.Encryption.Decrypt(strPwd)
+	'Temp password segment start
+	If String.IsNullOrEmpty(strPwd) Then
+		Dim upprChars As String = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+		Dim lwrChars As String = "abcdefghijklmnopqrstuvwxyz"
+		Dim numChars As String = "0123456789"
+		Dim specChars As String = "!@#$%^&*()"
+		Dim anumChars As String = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+		Dim r As New Random
+		Dim sb As StringBuilder = New StringBuilder
+		sb.Append(upprChars.Substring(r.Next(0, upprChars.Length - 1), 1))
+		sb.Append(lwrChars.Substring(r.Next(0, lwrChars.Length - 1), 1))
+		sb.Append(numChars.Substring(r.Next(0, numChars.Length - 1), 1))
+		sb.Append(specChars.Substring(r.Next(0, specChars.Length - 1), 1))
+		strPwd = sb.ToString()
+		For i As Integer = 1 To 16
+			strPwd = strPwd.Insert(r.Next(1, strPwd.Length - 1), anumChars.Substring(r.Next(0, anumChars.Length - 1), 1))
+		Next
+	End If
+	'Temp password segment end			
+	Dim sbParams As StringBuilder = New StringBuilder
+	sbParams.Append("USER_ID=" & strUserID & P_DELIMITER)
+	sbParams.Append("COPY_FROM_USER_ID=" & Connection.GetConfigParm("Custom\AURION_DCCEEW\ESSCreateFixedValues\UserTemplate") & P_DELIMITER)
+	sbParams.Append("OS_USER_ID=" & strOSUserID & P_DELIMITER)
+	sbParams.Append("USER_NAME=" & strUserName & P_DELIMITER)
+	sbParams.Append("WAMI_NO=" & strPersNumber & P_DELIMITER)
+	sbParams.Append("USER_STATUS=" & strAccStatus & P_DELIMITER)
+	sbParams.Append("USER_PASSWORD=" & strPwd & P_DELIMITER)
+	sbParams.Append("PASSWORD_EXPIRED=" & Connection.GetConfigParm("Custom\AURION_DCCEEW\ESSCreateFixedValues\PasswordExpired") & P_DELIMITER)
+	sbParams.Append("EXTERNAL_MAIL_TYPE=" & Connection.GetConfigParm("Custom\AURION_DCCEEW\ESSCreateFixedValues\MailType") & P_DELIMITER)
+	sbParams.Append("EMAIL_ADDRESS=" & strEmailAddr)
+	Dim P_PARAMETERS As String = sbParams.ToString()
+	CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_CALLFUNCTION3(P_TOKEN, """ & P_FUNCTION & """, """ & P_DELIMITER & """, """ & P_PARAMETERS & """)")
+	strAPIResponse = CCC_Aurion_CALLFUNCTION3(P_TOKEN, P_FUNCTION, P_DELIMITER, P_PARAMETERS, importSource)
+	strRtnVal = strAPIResponse
+	CCC_NLog_WriteLog(loggerName, "Trace", String.Format("Result: {0}/{1}: {2}", strOSUserID, strPersNumber, strAPIResponse.ToString()))
+	CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN)")
+	CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+	If strAPIResponse.ToUpperInvariant = Connection.GetConfigParm("Custom\AURION\ExistingESSAccountOutput").ToString.ToUpperInvariant Then
+		' download IAM_ESSUSER report XML from Aurion to match existing ESS user
+		If String.IsNullOrEmpty(strXMLDoc) Then
+			Dim QUERY_ID As String = Connection.GetConfigParm("Custom\AURION\QueryFilterFields\QueryIDs\SecurityProfile").ToString()
+			Dim filter As String = Connection.GetConfigParm("Custom\AURION\QueryFilterFields\PersonnelNumber") & "=" & strPersNumber
+			P_TOKEN = CCC_Aurion_LOGON(importSource)
+			' Perform Multi-Query to single XML Document
+			strXMLDoc = CCC_Aurion_QUERY_TO_XML(loggerName, P_TOKEN, QUERY_ID, filter, importSource)
+			Try
+				xmlDoc.LoadXml(strXMLDoc)
+			Catch ex As Exception
+				Dim strErrorMsg As StringBuilder = New StringBuilder
+				strErrorMsg.AppendLine("Error loading XML.")
+				strErrorMsg.AppendLine(ex.Message())
+				' Disconnect Web Service
+				CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN)")
+				CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+				' Throw error
+				CCC_NLog_WriteLog(loggerName, "Fatal", strErrorMsg.ToString())
+				Throw New AdHocDataException("Error loading XML. " & strErrorMsg.ToString())
+			End Try
+			CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN)")
+			CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+		End If
+		' compare with accounts in xml doc
+		Dim accountFound As Boolean = False
+		CCC_NLog_WriteLog(loggerName, "Debug", "Loop through XML")
+		For Each node As System.Xml.XmlElement In xmlDoc.DocumentElement
+			Dim strXMLMessGroup As String = node.Item("Messaging_Group").InnerText
+			Dim strXMLPersonNo As String = node.Item("Person_Number").InnerText
+			' Check for match of non-duplicate (INACTI) ESS user
+			If strXMLPersonNo = strPersNumber AndAlso strXMLMessGroup.ToUpperInvariant <> "INACTI" Then
+				Try
+					' load, update and save UNSAccountB - which will trigger seperate process to update Aurion
+					Dim dbAcct As IColDbObject = Connection.CreateCol("UNSAccountB")
+					dbAcct.Prototype.WhereClause = String.Format("UID_UNSAccountB = '{0}'", dbsUnsAccount.GetValue("UID_UNSAccountB").ToString())
+					CCC_NLog_WriteLog(loggerName, "Trace", "Load UNSAccountB.UID_UNSAccountB = '" & dbsUnsAccount.GetValue("UID_UNSAccountB").ToString() & "'")
+					dbAcct.Load()
+					Dim singleObj As ISingleDbObject = dbAcct(0).Create()
+					Dim strXMLUserId As String = node.Item("User_Id").InnerText
+					CCC_NLog_WriteLog(loggerName, "Trace", "Set UNSAccountB.cn = '" & strXMLUserId & "'")
+					singleObj.PutValue("cn", strXMLUserId)
+					Dim strDistName As String = singleObj.GetValue("DistinguishedName").ToString.Replace(strUserID, strXMLUserId)
+					CCC_NLog_WriteLog(loggerName, "Trace", "Set UNSAccountB.DistinguishedName = '" & strDistName & "'")
+					singleObj.PutValue("DistinguishedName", strDistName)
+					CCC_NLog_WriteLog(loggerName, "Trace", "Save UNSAccountB")
+					singleObj.Save()
+					strUserID = strXMLUserId
+					accountFound = True
+				Catch ex As Exception
+					Dim strErrorMsg As StringBuilder = New StringBuilder
+					strErrorMsg.AppendLine("Error updating UNSAccountB to join existing ESS Account")
+					strErrorMsg.AppendLine(String.Format("Person Number: {0}", strPersNumber))
+					strErrorMsg.AppendLine(ex.Message())
+					CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
+					RaiseMessage(MsgSeverity.Serious, "AURION - CCC_UNSAccountB_ESS_DCCEEW_Insert " & vbCrLf & strErrorMsg.ToString())
+				End Try
+				Exit For
+			End If
+		Next
+		If accountFound Then
+			strRtnVal = "UNSAccountB matched and joined to existing ESS account in Aurion - Updated by seperate process"
+			strRtnVal += CCC_ClearPassword(loggerName, strXObjectKey, "Password")
+		Else
+			Dim strErrorMsg As StringBuilder = New StringBuilder
+			strErrorMsg.AppendLine("AURION - Error in creating ESS user.")
+			strErrorMsg.AppendLine(strAPIResponse)
+			strErrorMsg.AppendLine(String.Format("Could not find and join non-INACTI ESS user with Person Number: {0}", strPersNumber))
+			CCC_NLog_WriteLog(loggerName, "Fatal", strErrorMsg.ToString())
+			RaiseMessage(MsgSeverity.Serious, "AURION - CCC_UNSAccountB_ESS_DCCEEW_Insert " & vbCrLf & strErrorMsg.ToString())
+			Throw New AdHocDataException(strErrorMsg.ToString())
+		End If
+	Else If strAPIResponse.StartsWith("Status") Then
+		If strAPIResponse.ToUpperInvariant = Connection.GetConfigParm("Custom\AURION\ExistingESStoUpdate").ToString.ToUpperInvariant Then
+			strRtnVal = CCC_UNSAccountB_ESS_DCCEEW_Update(dbsUnsAccount)
+		Else
+			' there was an error/issue
+			Dim strErrorMsg As StringBuilder = New StringBuilder
+			strErrorMsg.AppendLine("AURION - Error in creating ESS user.")
+			strErrorMsg.AppendLine(strAPIResponse)
+			CCC_NLog_WriteLog(loggerName, "Fatal", strErrorMsg.ToString())
+			RaiseMessage(MsgSeverity.Serious, "AURION - CCC_UNSAccountB_ESS_DCCEEW_Insert " & vbCrLf & strErrorMsg.ToString())
+			Throw New AdHocDataException(strErrorMsg.ToString())
+		End If
+	Else
+		strRtnVal = strAPIResponse
+		strRtnVal += CCC_ClearPassword(loggerName, strXObjectKey, "Password")
+	End If
+	CCC_NLog_WriteLog(loggerName, "Trace", "Return string: " & strRtnVal)
+	CCC_NLog_WriteLog(loggerName, "Debug", "Exiting CCC_UNSAccountB_ESSDCCEEW_Insert()")
+	Return strRtnVal
+End Function
