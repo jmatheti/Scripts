@@ -1,0 +1,139 @@
+' 12/07/2022 - BP - CentralAccount is now immutable and should not change, even on name change.
+' This function is no longer called
+
+''' <summary>
+''' Determine name change
+''' </summary>
+''' <param name="uidPerson">Person.UID_Person</param>
+''' <param name="FirstName">New Person.FirstName</param>
+''' <param name="LastName">New Person.LastName</param>
+''' <param name="PreferredName">New Person.PreferredName</param>
+''' <returns>String Result (NO_CHANGE|NEW_CHANGE|DELETE_CHANGE)</returns>
+Public Function CCC_Person_Name_Change(ByVal uidPerson As String, ByVal FirstName As String, ByVal LastName As String, ByVal PreferredName As String, ByVal company As String, ByVal org_FullPath As String, ByVal personObj As ISingleDbObject) As String
+	Dim loggerName As String = "PERSON_NAMECHANGE"
+	CCC_NLog_WriteLog(loggerName, "Debug", "Entering CCC_Person_Name_Change()")
+	If String.IsNullOrEmpty(uidPerson) Then
+		Dim strErrorMsg = New StringBuilder
+		strErrorMsg.AppendLine("ERROR PROCESSING NAME CHANGE CHECK")
+		strErrorMsg.AppendLine("Missing required UID_Person")
+		CCC_NLog_WriteLog(loggerName, "Fatal", strErrorMsg.ToString())
+		Throw New AdHocDataException(strErrorMsg.ToString())
+	End If
+	If String.IsNullOrEmpty(FirstName) AndAlso String.IsNullOrEmpty(LastName) AndAlso String.IsNullOrEmpty(PreferredName) AndAlso (String.IsNullOrEmpty(company) Or String.IsNullOrEmpty(org_FullPath)) Then
+		Dim strErrorMsg = New StringBuilder
+		strErrorMsg.AppendLine("ERROR PROCESSING NAME CHANGE CHECK")
+		strErrorMsg.AppendLine("No Name Change parameters passed")
+		CCC_NLog_WriteLog(loggerName, "Fatal", strErrorMsg.ToString())
+		Throw New AdHocDataException(strErrorMsg.ToString())
+	End If
+	Dim mail As String = CCC_AE_CreatedefaultMailAddress(PreferredName, LastName, uidperson, company, org_FullPath)
+	
+	Dim f As ISqlFormatter = Session.SqlFormatter
+	Dim result As String = "NO_CHANGE"
+	Dim whereClause As String = f.UidComparison("UID_Person", uidPerson, CompareOperator.Equal)
+	Dim chgwhereClause As String = f.UidComparison("CCC_UID_Person", uidPerson, CompareOperator.Equal)
+	CCC_NLog_WriteLog(loggerName, "Debug", "Loading Person Values")
+	Dim oldFirstName As String = Connection.GetSingleProperty("Person", "FirstName", whereClause).String
+	Dim oldLastName As String = Connection.GetSingleProperty("Person", "LastName", whereClause).String
+	Dim oldPreferredName As String = Connection.GetSingleProperty("Person", "PreferredName", whereClause).String
+	Dim oldMail As String = Connection.GetSingleProperty("Person", "DefaultEmailAddress", whereClause).String
+	If String.IsNullOrEmpty(FirstName) Then
+		FirstName = oldFirstName
+	End If
+	If String.IsNullOrEmpty(LastName) Then
+		LastName = oldLastName
+	End If
+	If String.IsNullOrEmpty(PreferredName) Then
+		PreferredName = oldPreferredName
+	End If
+	CCC_NLog_WriteLog(loggerName, "Debug", "Loading CCCPersonNameChange Values")
+	Dim chgFirstName As String = Connection.GetSingleProperty("CCCPersonNameChange", "CCC_FirstName", chgwhereClause).String
+	Dim chgLastName As String = Connection.GetSingleProperty("CCCPersonNameChange", "CCC_LastName", chgwhereClause).String
+	Dim chgPreferredName As String = Connection.GetSingleProperty("CCCPersonNameChange", "CCC_PreferredName", chgwhereClause).String
+	Dim chgMail As String = Connection.GetSingleProperty("CCCPersonNameChange", "CCC_DefaultEmailAddress", chgwhereClause).String
+	
+	' Action Immediately if Person has not started, otherwise log event for future processing
+	Dim hasStarted As Boolean = Not Connection.GetSingleProperty("Person", "EntryDate", whereClause).Date > Date.Now
+	
+	If Not hasStarted Then
+		CCC_NLog_WriteLog(loggerName, "Debug", "CCC_Person_Name_Change: Change detected on person not started. Update name details immediately.")
+		personObj.PutValue("FirstName", FirstName)
+		personObj.PutValue("LastName", LastName)
+		personObj.PutValue("PreferredName", PreferredName)
+		personObj.PutValue("DefaultEmailAddress", mail)
+		personObj.Save()
+		result = "IMMEDIATE_CHANGE"
+	End If
+	
+	If hasStarted Then
+		CCC_NLog_WriteLog(loggerName, "Debug", "CCC_Person_Name_Change: Change detected on person who has started. Record in change table.")
+		Using uow = Session.StartUnitOfWork()
+			If String.IsNullOrEmpty(chgFirstName) AndAlso String.IsNullOrEmpty(chgLastName) AndAlso String.IsNullOrEmpty(chgPreferredName) AndAlso String.IsNullOrEmpty(chgMail) Then
+				If oldFirstName <> FirstName Or oldLastName <> LastName Or oldPreferredName <> PreferredName Or oldMail <> mail Then
+					CCC_NLog_WriteLog(loggerName, "Debug", "New Name Change Entry")
+					Dim chgPerson As IEntity = Session.Source().CreateNew("CCCPersonNameChange")
+					chgPerson.PutValue("CCC_UID_Person", uidPerson)
+					chgPerson.PutValue("CCC_FirstName", FirstName)
+					chgPerson.PutValue("CCC_LastName", LastName)
+					chgPerson.PutValue("CCC_PreferredName", PreferredName)
+					chgPerson.PutValue("CCC_DefaultEmailAddress", mail)
+					chgPerson.PutValue("CCC_DeleteChange", False)
+					uow.Put(chgPerson)
+					result = "NEW_CHANGE"
+				End If
+			Else
+				Dim chgPersons = Connection.CreateCol("CCCPersonNameChange")
+				chgPersons.Prototype.WhereClause = chgwhereClause
+				chgPersons.Prototype("CCC_FirstName").IsDisplayItem = True
+				chgPersons.Prototype("CCC_LastName").IsDisplayItem = True
+				chgPersons.Prototype("CCC_PreferredName").IsDisplayItem = True
+				chgPersons.Prototype("CCC_DeleteChange").IsDisplayItem = True
+				chgPersons.Prototype("CCC_DefaultEmailAddress").IsDisplayItem = True
+				
+				'chgPerson.PutValue("CCC_DefaultEmailAddress", mail)
+				
+				chgPersons.Load()
+				Dim chgPerson = chgPersons(0).Create()
+				If oldFirstName = FirstName AndAlso oldLastName = LastName AndAlso oldPreferredName = PreferredName AndAlso oldMail = mail Then
+					CCC_NLog_WriteLog(loggerName, "Debug", "Reverse Name Change")
+					chgPerson.PutValue("CCC_DeleteChange", True)
+					result = "DELETE_CHANGE"
+				ElseIf chgFirstName <> FirstName Or chgLastName <> LastName Or chgPreferredName <> PreferredName Or chgMail <> mail Then
+					CCC_NLog_WriteLog(loggerName, "Debug", "Update Name Change Entry")
+					chgPerson.PutValue("CCC_FirstName", FirstName)
+					chgPerson.PutValue("CCC_LastName", LastName)
+					chgPerson.PutValue("CCC_PreferredName", PreferredName)
+					chgPerson.PutValue("CCC_DefaultEmailAddress", mail)
+					result = "NEW_CHANGE"
+				End If
+				If chgPerson.IsChanged() = True Then
+					chgPerson.Save()
+				End If
+			End If
+			uow.Commit()
+			End Using
+		End If
+		
+	CCC_NLog_WriteLog(loggerName, "Debug", "Exiting CCC_Person_Name_Change()")
+	Return result
+End Function
+
+' Check Mail Changes when Position's Department changes
+Public Function CCC_Person_Name_Change_ByDepartment(ByVal uidPosition As String, ByVal org_FullPath As String) As String
+	Dim dbPersons As IColDbObject = Connection.CreateCol("Person")
+
+	dbPersons.Prototype("UID_Person").IsDisplayItem = True
+	dbPersons.Prototype("CCC_Company").IsDisplayItem = True
+	
+	dbPersons.Prototype.WhereClause = "UID_Org = '" & uidPosition & "'"
+	dbPersons.Load()
+	If dbPersons.Count <= 0 Then 
+		Return "NO_CHANGE" 
+	End If
+	
+	Dim singleObj As ISingleDbObject = dbPersons(0).Create()
+	
+	Dim uidPerson As String = singleObj.GetValue("UID_Person").ToString()
+	Dim company As String = singleObj.GetValue("CCC_Company").ToString()
+	Return CCC_Person_Name_Change(uidPerson, "", "", "", company, org_FullPath, singleObj)
+End Function
