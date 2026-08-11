@@ -1,0 +1,65 @@
+#If Not SCRIPTDEBUGGER Then
+	Imports System.Data
+	Imports System.Xml
+#End If
+
+''' <summary>
+''' Update ESS Account from UNSAccountB
+''' </summary>
+''' <param name="dbsUnsAccount">SingleDbObjectSnapshot of UNSAccountB</param>
+''' <returns>API Response</returns>
+'''
+Public Function CCC_UNSAccountB_ESS_DCCEEW_Update(ByVal dbsUnsAccount As SingleDbObjectSnapshot) As String
+	Dim importSource As String = "AUR_DCCEEW"
+	Dim loggerName As String = "AURION_DCCEEW_USERS"
+	CCC_NLog_WriteLog(loggerName, "Debug", "Entering CCC_UNSAccountB_ESS_DCCEEW_Update(dbsUnsAccount)")
+	' vars
+	Dim strRtnVal As String = String.Empty
+	Dim strAPIResponse As String = String.Empty
+	Dim P_TOKEN As String = CCC_Aurion_LOGON(importSource)
+	' update Aurion ESS user
+	Dim P_FUNCTION As String = "SEC_USER_UPDATE"
+	Dim P_DELIMITER As String = ","
+	'attributes
+	Dim strAccStatus As String = String.Empty
+	If dbsUnsAccount.GetValue("AccountDisabled").Bool = True Then
+		CCC_NLog_WriteLog(loggerName, "Trace", "UNSAccountB.AccountDisabled = True")
+		strAccStatus = "I"
+	Else
+		CCC_NLog_WriteLog(loggerName, "Trace", "UNSAccountB.AccountDisabled = False")
+		strAccStatus = "P"
+	End If
+	Dim strObjectGUID As String = dbsUnsAccount.GetValue("ObjectGUID").ToString()
+	Dim strEmailAddr As String = dbsUnsAccount.GetValue("CCC_EmailAddress").ToString()
+	Dim strUserName As String = dbsUnsAccount.GetValue("DisplayName").ToString()
+	Dim strOSUserID As String = dbsUnsAccount.GetValue("AccountName").ToString()
+	Dim sbParams As StringBuilder = New StringBuilder
+	sbParams.Append("USER_MATCH_VALUE=" & strObjectGUID & P_DELIMITER)
+	sbParams.Append("OS_USER_ID=" & strOSUserID & P_DELIMITER)
+	sbParams.Append("USER_NAME=" & strUserNAme & P_DELIMITER)
+	sbParams.Append("USER_STATUS=" & strAccStatus & P_DELIMITER)
+	sbParams.Append("EMAIL_ADDRESS=" & strEmailADdr)
+	Dim P_PARAMETERS As String = sbParams.ToString()
+	CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_CALLFUNCTION3(P_TOKEN, """ & P_FUNCTION & """, """ & P_DELIMITER & """, """ & P_PARAMETERS & """)")
+	strAPIResponse = CCC_Aurion_CALLFUNCTION3(P_TOKEN, P_FUNCTION, P_DELIMITER, P_PARAMETERS, importSource)
+	CCC_NLog_WriteLog(loggerName, "Trace", String.Format("Result: {0}/{1}: {2}", strOSUserID, dbsUnsAccount.GetValue("CCC_PersonnelNumber").ToString(), strAPIResponse.ToString()))
+	CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN)")
+	CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+	If strAPIResponse.StartsWith("Status") Then
+		' there was an error/issue
+		' Stop
+		Dim strErrorMsg As StringBuilder = New StringBuilder
+		strErrorMsg.AppendLine("AURION - Error in updating ESS user.")
+		strErrorMsg.AppendLine(String.Format("Username: {0}", strOSUserID))
+		strErrorMsg.AppendLine(strAPIResponse)
+		CCC_NLog_WriteLog(loggerName, "Fatal", strErrorMsg.ToString())
+		RaiseMessage(MsgSeverity.Serious, "AURION - CCC_UNSAccountB_ESS_DCCEEW_Update " & vbCrLf & strErrorMsg.ToString())
+		Throw New AdHocDataException(strErrorMsg.ToString())
+	Else
+		' Stop ' success
+		strRtnVal = strAPIResponse
+	End If
+	CCC_NLog_WriteLog(loggerName, "Trace", "Returning " & strRtnVal)
+	CCC_NLog_WriteLog(loggerName, "Debug", "Exiting CCC_UNSAccountB_ESS_DCCEEW_Update()")
+	Return strRtnVal
+End Function
