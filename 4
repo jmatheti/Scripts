@@ -1,0 +1,60 @@
+''' <summary>
+''' Import of Users from Aurion via Schedule
+''' </summary>
+''' <returns>String result message</returns>
+''' 
+Public Function CCC_Aurion_Support_Employee(employeeNumber As String) As String
+	Dim importSource As String = "AUR"
+	Dim loggerName As String = "AURION_SUPPORT_EMPLOYMENT"
+	CCC_NLog_WriteLog(loggerName, "Debug", "Entering CCC_Aurion_Support_Employee()")
+	
+	'
+	' This script will sync the Employment records from Aurion HR to the Person table in OneIM
+	'
+	' vars
+	Dim strXMLDocEmp As String = String.Empty
+	Dim xmlDocEmp As Xml.XmlDocument = New Xml.XmlDocument
+	Dim filterPattern As String = Connection.GetConfigParm("Custom\AURION\QueryFilterFields\EmployeeNumber") & "={0}|" & Connection.GetConfigParm("Custom\AURION\QueryFilterFields\EmployeeNumber") & "={0}"
+
+	Dim filter As String = String.Empty
+	' Initiate Web Service
+	Dim QUERY_ID As String = String.Empty
+	Dim P_TOKEN As String = CCC_Aurion_LOGON(importSource)
+	
+	filter = String.Format(filterPattern, employeeNumber)
+	CCC_NLog_WriteLog(loggerName, "Debug", "Filter Calculation:" & filter)
+
+	' Perform Employment Multi-Query to single XML Document
+	QUERY_ID = Connection.GetConfigParm("Custom\AURION\QueryFilterFields\QueryIDs\Employments").ToString()
+	strXMLDocEmp = CCC_Aurion_QUERY_TO_XML(loggerName, P_TOKEN, QUERY_ID, filter, importSource)
+	Try
+		xmlDocEmp.LoadXml(strXMLDocEmp)
+	Catch ex As Exception
+		Dim strErrorMsg As StringBuilder = New StringBuilder
+		strErrorMsg.AppendLine("Error loading XML.")
+		strErrorMsg.AppendLine(ex.Message())
+		' Disconnect Web Service
+		CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN)")
+		CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+		' Throw error
+		CCC_NLog_WriteLog(loggerName, "Fatal", strErrorMsg.ToString())
+		Throw New AdHocDataException("Error loading XML. " & strErrorMsg.ToString())
+	End Try
+
+	' Disconnect Web Service
+	CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN)")
+	CCC_Aurion_LOGOFF(P_TOKEN, importSource)
+
+	'CCC_NLog_WriteLog(loggerName, "Debug", "Result: " & strXMLDocEmp.ToString())
+	
+	Dim fmtStr As String = "" & Environment.NewLine
+	For Each node As System.Xml.XmlElement In xmlDocEmp.DocumentElement
+		For Each nodeItem As System.Xml.XmlElement In node
+			fmtStr &= nodeItem.Name & ": " & nodeItem.InnerText & Environment.NewLine
+		Next 
+	Next
+			
+	CCC_NLog_WriteLog(loggerName, "Debug", "Result Found: " & fmtStr)
+	
+	Return strXMLDocEmp.ToString()
+End Function
