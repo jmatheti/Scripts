@@ -98,7 +98,7 @@ Function CCC_UNSAccountB_ESS_DCCEEW_Insert(ByVal dbsUnsAccount As SingleDbObject
 			Catch ex As Exception
 				Dim strErrorMsg As StringBuilder = New StringBuilder
 				strErrorMsg.AppendLine("Error loading XML.")
-				strErrorMsg.AppendLine(ex.Message())
+				strErrorMsg.AppendLine(ex.Message)
 				' Disconnect Web Service
 				CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN)")
 				CCC_Aurion_LOGOFF(P_TOKEN, importSource)
@@ -138,7 +138,7 @@ Function CCC_UNSAccountB_ESS_DCCEEW_Insert(ByVal dbsUnsAccount As SingleDbObject
 					Dim strErrorMsg As StringBuilder = New StringBuilder
 					strErrorMsg.AppendLine("Error updating UNSAccountB to join existing ESS Account")
 					strErrorMsg.AppendLine(String.Format("Person Number: {0}", strPersNumber))
-					strErrorMsg.AppendLine(ex.Message())
+					strErrorMsg.AppendLine(ex.Message)
 					CCC_NLog_WriteLog(loggerName, "Error", strErrorMsg.ToString())
 					RaiseMessage(MsgSeverity.Serious, "AURION - CCC_UNSAccountB_ESS_DCCEEW_Insert " & vbCrLf & strErrorMsg.ToString())
 				End Try

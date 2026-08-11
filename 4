@@ -32,7 +32,7 @@ Public Function CCC_Aurion_Support_Employee(employeeNumber As String) As String
 	Catch ex As Exception
 		Dim strErrorMsg As StringBuilder = New StringBuilder
 		strErrorMsg.AppendLine("Error loading XML.")
-		strErrorMsg.AppendLine(ex.Message())
+		strErrorMsg.AppendLine(ex.Message)
 		' Disconnect Web Service
 		CCC_NLog_WriteLog(loggerName, "Debug", "Calling CCC_Aurion_LOGOFF(P_TOKEN)")
 		CCC_Aurion_LOGOFF(P_TOKEN, importSource)
